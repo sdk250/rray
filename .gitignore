@@ -1,1 +1,4 @@
 /target
+/docs/
+config.toml
+/vendor/rustls/target
