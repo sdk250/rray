@@ -61,7 +61,7 @@ pub async fn read_response_header<R: AsyncRead + Unpin>(r: &mut R) -> Result<()>
     let mut head = [0u8; 2];
     r.read_exact(&mut head).await?; // version, addonLen
     if head[0] != VERSION {
-        return Err(RError::Vless("bad response version"));
+        return Err(RError::Vless("bad response version".into()));
     }
     let addon_len = head[1] as usize;
     if addon_len > 0 {

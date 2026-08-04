@@ -11,14 +11,14 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> Result<T
     let mut head = [0u8; 2];
     s.read_exact(&mut head).await?;
     if head[0] != 0x05 {
-        return Err(RError::Socks5("unsupported version"));
+        return Err(RError::Socks5("unsupported version".into()));
     }
     let nmethods = head[1] as usize;
     let mut methods = vec![0u8; nmethods];
     s.read_exact(&mut methods).await?;
     if !methods.contains(&0x00) {
         s.write_all(&[0x05, 0xFF]).await?;
-        return Err(RError::Socks5("no acceptable auth method"));
+        return Err(RError::Socks5("no acceptable auth method".into()));
     }
     s.write_all(&[0x05, 0x00]).await?; // no-auth
 
@@ -26,10 +26,10 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> Result<T
     let mut req = [0u8; 4];
     s.read_exact(&mut req).await?;
     if req[0] != 0x05 {
-        return Err(RError::Socks5("bad request version"));
+        return Err(RError::Socks5("bad request version".into()));
     }
     if req[1] != 0x01 {
-        return Err(RError::Socks5("only CONNECT supported"));
+        return Err(RError::Socks5("only CONNECT supported".into()));
     }
     let addr = match req[3] {
         0x01 => {
@@ -47,9 +47,9 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S) -> Result<T
             s.read_exact(&mut l).await?;
             let mut d = vec![0u8; l[0] as usize];
             s.read_exact(&mut d).await?;
-            Address::Domain(String::from_utf8(d).map_err(|_| RError::Socks5("bad domain"))?)
+            Address::Domain(String::from_utf8(d).map_err(|_| RError::Socks5("bad domain".into()))?)
         },
-        _ => return Err(RError::Socks5("bad ATYP")),
+        _ => return Err(RError::Socks5("bad ATYP".into())),
     };
     let mut p = [0u8; 2];
     s.read_exact(&mut p).await?;

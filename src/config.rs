@@ -202,7 +202,7 @@ impl TryFrom<RawConfig> for Config {
 
 pub fn load(path: &str) -> Result<Config> {
     let text = std::fs::read_to_string(path)?;
-    let raw: RawConfig = toml::from_str(&text).map_err(|e| RError::Config(e.to_string()))?;
+    let raw: RawConfig = toml::from_str(&text).map_err(|e| RError::Config(e.to_string().into()))?;
     raw.try_into()
 }
 

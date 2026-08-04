@@ -21,7 +21,7 @@ pub struct Target {
 
 /// 带超时的拨号，失败后按 `retries` 次线性退避重试；成功即开 TCP_NODELAY。
 pub async fn dial(server: &str, port: u16, connect_ms: u64, retries: u32) -> Result<TcpStream> {
-    let mut last = RError::Protocol("no dial attempt");
+    let mut last = RError::Protocol("no dial attempt".into());
 
     for attempt in 0..=retries {
         match timeout(Duration::from_millis(connect_ms), TcpStream::connect((server, port))).await {
@@ -30,7 +30,7 @@ pub async fn dial(server: &str, port: u16, connect_ms: u64, retries: u32) -> Res
                 return Ok(s);
             },
             Ok(Err(e)) => last = RError::from(e),
-            Err(_) => last = RError::Protocol("connect timeout"),
+            Err(_) => last = RError::Protocol("connect timeout".into()),
         }
         if attempt < retries {
             sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
