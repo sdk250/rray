@@ -243,6 +243,20 @@ impl<S> VisionStream<S> {
             read_out: BytesMut::new(),
         }
     }
+
+    /// 首帧（携带 UUID 的伪装帧）已经由调用方连同 VLESS 头一起发出时用这个构造器，
+    /// 避免 UUID 前缀被写第二次。见 docs/reference/vision-format.md。
+    pub fn with_first_frame_sent(inner: S) -> Self {
+        let mut s = Self::new(inner, [0u8; 16]);
+        s.padder.uuid = None;
+        s
+    }
+}
+
+/// 伪装帧：空内容 + 长 padding，用来和 VLESS 头拼在同一次写入里遮住头的长度特征。
+/// 对应 xray 的 `XtlsPadding(nil, CommandPaddingContinue, &writeOnceUserUUID, true, ...)`。
+pub fn camouflage_frame(uuid: &[u8; 16]) -> Vec<u8> {
+    xtls_padding(&[], CMD_PADDING_CONTINUE, Some(uuid), true)
 }
 
 impl<S: tokio::io::AsyncWrite + Unpin> VisionStream<S> {
