@@ -1,8 +1,12 @@
 use tracing_subscriber::fmt as tracing_fmt;
 use time::macros::{ format_description as time_description, offset as time_offset };
 
-pub fn logger_service(with_ansi: bool, with_file: bool, with_line_number: bool)
-    -> tracing_appender::non_blocking::WorkerGuard
+pub fn logger_service(
+    level: tracing::Level,
+    with_ansi: bool,
+    with_file: bool,
+    with_line_number: bool
+) -> tracing_appender::non_blocking::WorkerGuard
 {
     // 自定义时间格式 +8时区
     let timer = tracing_fmt::time::OffsetTime::new(
@@ -16,7 +20,7 @@ pub fn logger_service(with_ansi: bool, with_file: bool, with_line_number: bool)
         .with_writer(non_blocking)
         .with_target(false)
         .with_timer(timer)
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(level)
         .with_ansi(with_ansi)
         .with_file(with_file)
         .with_line_number(with_line_number)

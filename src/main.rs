@@ -1,6 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
-
-
 mod config;
 mod error;
 mod ext;
@@ -11,51 +8,80 @@ mod relay;
 mod driver;
 
 
-use tracing::{ error, info };
+use std::sync::Arc;
+
+use tracing::{ error, info, warn };
 use tokio::{
-    net::{ TcpListener, TcpStream },
+    net::TcpListener,
     time::{ sleep, Duration }
 };
 
+use config::Config;
 use error::{ Result, RError };
 use ext::logger_service;
 use driver::handle_connection;
 
 
-const HOST: &'static str = "0.0.0.0";
-const PORT: u16 = 20880;
+const CONFIG_PATH: &str = "config.toml";
 
 
-async fn _main() -> Result<()> {
-    let listener = TcpListener::bind((HOST, PORT)).await?;
-    info!("Server listening on {}:{}", HOST, PORT);
+fn parse_level(s: &str) -> Result<tracing::Level> {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => Ok(tracing::Level::TRACE),
+        "debug" => Ok(tracing::Level::DEBUG),
+        "info" => Ok(tracing::Level::INFO),
+        "warn" | "warning" => Ok(tracing::Level::WARN),
+        "error" => Ok(tracing::Level::ERROR),
+        other => Err(RError::Config(format!("unknown log level: {other}").into())),
+    }
+}
+
+async fn serve(cfg: Arc<Config>) -> Result<()> {
+    let listener = TcpListener::bind((cfg.inbound.listen, cfg.inbound.port)).await?;
+    info!("SOCKS5 listening on {}:{}", cfg.inbound.listen, cfg.inbound.port);
+    info!("outbound {}:{} (sni {})", cfg.outbound.server, cfg.outbound.port, cfg.outbound.reality.server_name);
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                info!("New connection from {}", peer_addr);
+                let cfg = cfg.clone();
+                // 每条连接独立 spawn：单连接的错误不影响其它连接。
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection().await {
-                        error!("Error handling connection from {}: {}", peer_addr, e);
+                    if let Err(e) = handle_connection(stream, cfg).await {
+                        warn!("connection from {} failed: {}", peer_addr, e);
                     }
                 });
             },
             Err(e) => {
-                error!("Failed to accept connection: {}", e);
-                sleep(Duration::from_secs(10)).await;
+                error!("failed to accept connection: {}", e);
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
-
-    #[allow(unreachable_code)]
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    let _log_guard = logger_service(true, true, true);
+    let cfg = match config::load(CONFIG_PATH) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // 日志还没起来，只能直接打到 stderr。
+            eprintln!("failed to load {CONFIG_PATH}: {e}");
+            std::process::exit(1);
+        },
+    };
 
-    if let Err(e) = _main().await {
-        error!("Error: {}", e);
+    let level = match parse_level(&cfg.log.level) {
+        Ok(level) => level,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        },
+    };
+    let _log_guard = logger_service(level, true, true, true);
+
+    if let Err(e) = serve(Arc::new(cfg)).await {
+        error!("fatal: {}", e);
+        std::process::exit(1);
     }
 }

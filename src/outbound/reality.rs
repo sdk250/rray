@@ -485,11 +485,16 @@ pub async fn connect(
     let sni = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
         .map_err(|_| RError::Reality("bad server_name".into()))?;
 
-    let mut seed = [0u8; 32];
-    let mut kx_secret = [0u8; 32];
-    let mut rng = rand::rng();
-    rng.fill(&mut seed);
-    rng.fill(&mut kx_secret);
+    // ThreadRng 不是 Send，必须在第一个 await 之前就用完丢掉，
+    // 否则整个 future 不是 Send，没法 tokio::spawn。
+    let (seed, kx_secret) = {
+        let mut rng = rand::rng();
+        let mut seed = [0u8; 32];
+        let mut kx_secret = [0u8; 32];
+        rng.fill(&mut seed);
+        rng.fill(&mut kx_secret);
+        (seed, kx_secret)
+    };
 
     let unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
