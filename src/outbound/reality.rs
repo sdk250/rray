@@ -475,11 +475,16 @@ fn prepare(
 }
 
 /// 完成 Reality TLS 握手，产出可读写的 TLS 流。
-pub async fn connect(
-    tcp: tokio::net::TcpStream,
+///
+/// 对底层流泛型：出站路径会在 TCP 与 rustls 之间夹一层 `RecordGate`（见 record_gate 模块）。
+pub async fn connect<S>(
+    tcp: S,
     cfg: &crate::config::RealityCfg,
     handshake_ms: u64,
-) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+) -> Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use rand::RngExt;
 
     let sni = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())

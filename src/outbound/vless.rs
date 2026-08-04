@@ -56,7 +56,55 @@ pub fn encode_request_header(uuid: &[u8; 16], flow: &str, target: &Target) -> Ve
     h
 }
 
-/// 读掉响应头 `version(1) | addonLen(1) | addons`，其后即被代理数据。
+/// 在**读路径**上惰性剥离响应头 `version(1) | addonLen(1) | addons`。
+///
+/// 不能在发完请求后同步等这个头：xray 服务端把响应头写在 BufferedWriter 里，
+/// 要等有下行数据才 flush，而下行数据又要等我们先发上行载荷 —— 同步等会死锁。
+/// （xray 自己的客户端把读响应头放在独立 goroutine 里。）
+#[derive(Debug, Default)]
+pub struct ResponseHeader {
+    done: bool,
+}
+
+impl ResponseHeader {
+    pub fn new() -> Self {
+        Self { done: false }
+    }
+
+    /// 响应头已由别处消费（或本来就没有）时用这个。
+    pub fn already_consumed() -> Self {
+        Self { done: true }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// 尝试从 `buf` 头部吃掉响应头。字节不够就原样留着，返回 `Ok(false)`。
+    pub fn feed(&mut self, buf: &mut bytes::BytesMut) -> Result<bool> {
+        use bytes::Buf;
+
+        if self.done {
+            return Ok(true);
+        }
+        if buf.len() < 2 {
+            return Ok(false);
+        }
+        if buf[0] != VERSION {
+            return Err(RError::Vless("bad response version".into()));
+        }
+        let addon_len = buf[1] as usize;
+        if buf.len() < 2 + addon_len {
+            return Ok(false);
+        }
+        buf.advance(2 + addon_len);
+        self.done = true;
+        Ok(true)
+    }
+}
+
+/// 同步读掉响应头。仅用于测试与不存在死锁风险的场景。
+#[allow(dead_code)]
 pub async fn read_response_header<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> {
     let mut head = [0u8; 2];
     r.read_exact(&mut head).await?; // version, addonLen

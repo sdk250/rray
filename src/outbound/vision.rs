@@ -121,6 +121,7 @@ impl Unpadder {
             out.extend_from_slice(&buf[..content_len]);
             buf.advance(content_len + pad_len);
 
+            tracing::debug!(command, content_len, pad_len, "vision frame in");
             match command {
                 CMD_PADDING_CONTINUE => {},
                 CMD_PADDING_END | CMD_PADDING_DIRECT => self.direct = true,
@@ -230,6 +231,8 @@ pub struct VisionStream<S> {
     read_raw: BytesMut,
     /// 已解出、待交付上层的数据。
     read_out: BytesMut,
+    /// VLESS 响应头在读路径上惰性剥离（同步等会死锁，见 vless::ResponseHeader）。
+    response_header: super::vless::ResponseHeader,
 }
 
 impl<S> VisionStream<S> {
@@ -241,14 +244,18 @@ impl<S> VisionStream<S> {
             write_pending: BytesMut::new(),
             read_raw: BytesMut::with_capacity(16 * 1024),
             read_out: BytesMut::new(),
+            // 纯 Vision 流（测试用）不带 VLESS 响应头。
+            response_header: super::vless::ResponseHeader::already_consumed(),
         }
     }
 
-    /// 首帧（携带 UUID 的伪装帧）已经由调用方连同 VLESS 头一起发出时用这个构造器，
-    /// 避免 UUID 前缀被写第二次。见 docs/reference/vision-format.md。
+    /// 客户端出站路径的构造器：首帧（携带 UUID 的伪装帧）已经由 `outbound::open`
+    /// 连同 VLESS 头一起发出，故不再写 UUID 前缀；而 VLESS **响应**头还没读，
+    /// 要在读路径上惰性剥离。见 docs/reference/vision-format.md。
     pub fn with_first_frame_sent(inner: S) -> Self {
         let mut s = Self::new(inner, [0u8; 16]);
         s.padder.uuid = None;
+        s.response_header = super::vless::ResponseHeader::new();
         s
     }
 }
@@ -331,7 +338,9 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for VisionStream<S>
     }
 }
 
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for VisionStream<S> {
+impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::io::AsyncRead
+    for VisionStream<S>
+{
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -350,10 +359,14 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for VisionStream<S> {
                 return Poll::Ready(Ok(()));
             }
 
-            // 直通且无残留：直接读进上层缓冲，省一次拷贝。
-            if me.unpadder.is_direct() && me.read_raw.is_empty() {
-                return std::pin::Pin::new(&mut me.inner).poll_read(cx, buf);
+            // 已切直通：服务端此后写的是裸 TCP，越过 TLS 直接读。
+            if me.unpadder.is_direct() {
+                return std::pin::Pin::new(&mut me.inner).poll_read_direct(cx, buf);
             }
+
+            // 还在 padding 阶段：放行下一条 TLS 记录，好让我们逐条检查明文里
+            // 有没有 Direct 命令。见 record_gate 模块。
+            me.inner.open_record_gate();
 
             let mut chunk = [0u8; 16 * 1024];
             let mut read_buf = tokio::io::ReadBuf::new(&mut chunk);
@@ -365,11 +378,29 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for VisionStream<S> {
             }
             me.read_raw.extend_from_slice(read_buf.filled());
 
+            // 先吃掉 VLESS 响应头，其后才是 Vision 帧。
+            let header_done = me
+                .response_header
+                .feed(&mut me.read_raw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            if !header_done {
+                continue;
+            }
+
+            let was_direct = me.unpadder.is_direct();
             let mut out = Vec::new();
             me.unpadder
                 .unpad(&mut me.read_raw, &mut out)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             me.read_out.extend_from_slice(&out);
+
+            // 刚刚切到直通：把 TLS 层下面已缓冲、尚未解析的裸字节接上，
+            // 它们就是直通流的开头（等价于 Go 版合并 rawInput 的那一步）。
+            if !was_direct && me.unpadder.is_direct() {
+                let leftover = me.inner.take_buffered_raw();
+                tracing::debug!(leftover = leftover.len(), "vision switched to direct");
+                me.read_out.extend_from_slice(&leftover);
+            }
             // out 可能为空（帧还没收全），循环回去继续读。
         }
     }
@@ -563,6 +594,47 @@ mod tests {
         let mut got = vec![0u8; 10];
         vs.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"fragmented");
+    }
+
+    /// 出站路径：VLESS 响应头必须在读路径上被吃掉，且不能同步等它（会死锁）。
+    #[tokio::test]
+    async fn stream_strips_vless_response_header_lazily() {
+        let (mut peer, sock) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::with_first_frame_sent(sock);
+
+        // 客户端必须能在收到任何下行字节之前就把上行载荷发出去，
+        // 否则就是那个环等死锁。
+        vs.write_all(b"uplink first").await.unwrap();
+        vs.flush().await.unwrap();
+        let mut sink = vec![0u8; 4096];
+        let n = peer.read(&mut sink).await.unwrap();
+        assert!(n > 0, "上行数据没能在收到响应头之前发出 —— 死锁");
+
+        // 服务端这才回：VLESS 响应头(ver=0, addonLen=0) + Vision 帧
+        let mut wire = vec![0x00, 0x00];
+        wire.extend_from_slice(&xtls_padding(b"downlink", CMD_PADDING_END, Some(&UUID), false));
+        peer.write_all(&wire).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let mut got = vec![0u8; 8];
+        vs.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"downlink");
+    }
+
+    /// 响应头带 addons 时也要正确跳过。
+    #[tokio::test]
+    async fn stream_skips_response_header_with_addons() {
+        let (mut peer, sock) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::with_first_frame_sent(sock);
+
+        let mut wire = vec![0x00, 0x03, 0xAA, 0xBB, 0xCC];
+        wire.extend_from_slice(&xtls_padding(b"payload", CMD_PADDING_END, Some(&UUID), false));
+        peer.write_all(&wire).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let mut got = vec![0u8; 7];
+        vs.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"payload");
     }
 
     /// padding 长度必须落在 xray 的公式范围内，且不越 buf.Size 上限。
