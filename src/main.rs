@@ -7,6 +7,7 @@ mod ext;
 mod net;
 mod inbound;
 mod outbound;
+mod relay;
 mod driver;
 
 
