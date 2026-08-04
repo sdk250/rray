@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 bytes = "1.11.1"
 rand = "0.10.0"
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["macros"] }
 tokio = { version = "1.50.0", features = ["full"] }
+toml = "1.1.4"
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.23", features = ["time"] }
