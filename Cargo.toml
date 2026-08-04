@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.11.0"
 bytes = "1.11.1"
+hkdf = "0.13.0"
+hmac = "0.13.0"
 rand = "0.10.0"
+rustls = { version = "0.23.43", default-features = false, features = ["std", "tls12", "aws-lc-rs"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["macros"] }
 tokio = { version = "1.50.0", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-lc-rs"] }
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
