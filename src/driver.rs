@@ -3,7 +3,7 @@ use tokio::{
     time::{ timeout, Duration }
 };
 
-use crate::error::{ Result, RError };
+use crate::error::Result;
 
 const SERVER_HOST: &'static str = "192.168.3.2";
 const SERVER_PORT: u16 = 20881;
@@ -16,8 +16,6 @@ pub(crate) async fn handle_connection() -> Result<()> {
 
     // Set TCP_NODELAY to disable Nagle's algorithm for low-latency communication
     server_socket.set_nodelay(true)?;
-
-    let mut csprng = rand::thread_rng();
 
     Ok(())
 }
