@@ -4,6 +4,7 @@
 mod config;
 mod error;
 mod ext;
+mod net;
 mod driver;
 
 
