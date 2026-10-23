@@ -202,13 +202,94 @@ impl TryFrom<RawConfig> for Config {
 
 pub fn load(path: &str) -> Result<Config> {
     let text = std::fs::read_to_string(path)?;
-    let raw: RawConfig = toml::from_str(&text).map_err(|e| RError::Config(e.to_string().into()))?;
+    let raw: RawConfig = toml::from_str(&text).map_err(|e| describe_toml_error(&e, &text))?;
     raw.try_into()
+}
+
+/// 把 `toml::de::Error` 转换成不含配置原文的诊断信息。
+///
+/// `toml::de::Error` 的 `Display`/`to_string()` 会把出错那一行的原文整行
+/// 回显出来（外加一个插入符 `^` 指出具体位置），例如：
+///
+/// ```text
+/// TOML parse error at line 3, column 37
+///   |
+/// 3 | uuid = "6f9c1a2b-BADSECRETVALUE-oops
+///   |                                     ^
+/// invalid basic string, expected `"`
+/// ```
+///
+/// 我们的配置里 `uuid`（VLESS 凭据）、`public_key`/`short_id`（REALITY 凭据）
+/// 都可能出现在出错的那一行——比如手抖漏打了个引号——这串文字随后会被
+/// 打印或写进日志，凭据就跟着泄漏了。
+///
+/// 用 `message()`（纯错误描述，不含代码片段）+ `span()`（可选的字节偏移
+/// 区间，我们自己换算成行列号）拼诊断信息，代替 `Display`，这样类别和出错
+/// 位置还在，但绝不会回显那一行的原文。
+fn describe_toml_error(e: &toml::de::Error, text: &str) -> RError {
+    let msg = match e.span() {
+        Some(span) => {
+            let (line, col) = line_col(text, span.start);
+            format!("TOML 解析失败（第 {line} 行第 {col} 列）：{}", e.message())
+        }
+        None => format!("TOML 解析失败：{}", e.message()),
+    };
+    RError::Config(msg.into())
+}
+
+/// 把字节偏移换算成 1-based 的 (行, 列)。列按 Unicode 标量值（char）计数。
+fn line_col(text: &str, byte_offset: usize) -> (usize, usize) {
+    let mut offset = byte_offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for ch in text[..offset].chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1 回归测试：语法错误的 TOML 里含一段可识别的假凭据，错误消息里
+    /// 不得回显它——`toml::de::Error` 的 `Display` 会把出错那一行原文整行
+    /// 打出来，这个假凭据就是用来抓这个回归的哨兵。
+    #[test]
+    fn load_error_does_not_leak_config_contents() {
+        let text = r#"
+[log]
+level = "info"
+[inbound]
+listen = "127.0.0.1"
+port = 1080
+[outbound]
+server = "ex.com"
+port = 443
+[outbound.vless]
+uuid = "SECRET_SENTINEL_VALUE-oops
+flow = "xtls-rprx-vision"
+"#;
+        let path = std::env::temp_dir().join(format!("rray-c1-{}.toml", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let err = load(path.to_str().unwrap()).expect_err("缺右引号应当解析失败");
+        let _ = std::fs::remove_file(&path);
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("SECRET_SENTINEL_VALUE"),
+            "错误消息泄漏了配置原文：{msg}"
+        );
+        // 位置信息仍然要在，排错才有依据
+        assert!(msg.contains("第 11 行"), "错误消息缺少行号：{msg}");
+    }
 
     const SAMPLE: &str = r#"
 [log]
