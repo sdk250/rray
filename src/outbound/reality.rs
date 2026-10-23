@@ -16,6 +16,12 @@
 //!
 //! 哪一次取随机是 session_id 不靠猜：A 趟记录每次 RNG 返回值，再看哪一个落在
 //! ClientHello 的 session_id 偏移上，反查出调用序号。
+//!
+//! key_share 是 `[X25519MLKEM768, X25519]`（与 Chrome 同形）：xray v26.9.8 起
+//! （XTLS/REALITY 8cdf7bf9）服务端拒绝没有「X25519MLKEM768 在前」的 ClientHello，
+//! 直接转给伪装站。两份 share 的 x25519 部分共用脚本私钥——服务端拿它做认证。
+//! ML-KEM 密钥对每条连接只生成一次：A 趟只用它的公钥字节，B 趟拿走整个
+//! 密钥对象（握手时要解封装），两趟的 ClientHello 因此逐字节一致。
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -77,6 +83,32 @@ struct Script {
     replace: Option<(usize, Vec<u8>)>,
     /// key_share 用的 x25519 私钥（两趟必须一致）。
     kx_secret: [u8; 32],
+    /// 混合 key_share 的 ML-KEM 部分，见 [`MlkemShare`]。
+    mlkem: Option<MlkemShare>,
+}
+
+/// 混合 key_share 的 ML-KEM-768 部分。两趟必须给出同一把公钥。
+pub(crate) enum MlkemShare {
+    /// A 趟：只需要公钥字节来拼 ClientHello，这一趟永远不会完成握手。
+    PubOnly(Vec<u8>),
+    /// B 趟：真正的密钥对象，服务端选了混合组时要用它解封装。
+    Active(Box<dyn ActiveKeyExchange>),
+}
+
+impl MlkemShare {
+    fn pub_key(&self) -> &[u8] {
+        match self {
+            MlkemShare::PubOnly(bytes) => bytes,
+            MlkemShare::Active(kx) => kx.pub_key(),
+        }
+    }
+}
+
+/// 为一条连接生成 ML-KEM-768 密钥对（用 aws-lc-rs 的实现，不经过脚本随机）。
+pub(crate) fn new_mlkem() -> Result<Box<dyn ActiveKeyExchange>> {
+    rustls::crypto::aws_lc_rs::kx_group::MLKEM768
+        .start()
+        .map_err(|e| RError::Reality(format!("ml-kem keygen: {e}").into()))
 }
 
 thread_local! {
@@ -163,12 +195,111 @@ impl ActiveKeyExchange for ScriptedX25519Kx {
     }
 }
 
+// ---------------------------------------------------------------------------
+// X25519MLKEM768 混合 key share（x25519 部分取脚本私钥）
+// ---------------------------------------------------------------------------
+
+/// draft-ietf-tls-ecdhe-mlkem：客户端 share = ML-KEM 封装公钥 ‖ x25519 公钥，
+/// 服务端 share = ML-KEM 密文 ‖ x25519 公钥，共享密钥 = ML-KEM 密钥 ‖ x25519 密钥。
+const MLKEM768_ENCAP_LEN: usize = 1184;
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+const X25519_LEN: usize = 32;
+
+#[derive(Debug)]
+struct ScriptedX25519Mlkem768;
+
+static SCRIPTED_X25519MLKEM768: ScriptedX25519Mlkem768 = ScriptedX25519Mlkem768;
+
+struct ScriptedHybridKx {
+    x25519: ScriptedX25519Kx,
+    /// A 趟为 None：那一趟只取 ClientHello，不会走到 complete。
+    mlkem: Option<Box<dyn ActiveKeyExchange>>,
+    combined_pub: Vec<u8>,
+}
+
+impl SupportedKxGroup for ScriptedX25519Mlkem768 {
+    fn start(&self) -> std::result::Result<Box<dyn ActiveKeyExchange>, TlsError> {
+        let (secret, mlkem) = SCRIPT.with(|s| {
+            let mut slot = s.borrow_mut();
+            let script = slot.as_mut()?;
+            Some((script.kx_secret, script.mlkem.take()))
+        })
+        .ok_or(TlsError::General("reality: no key share script active".into()))?;
+        let mlkem = mlkem.ok_or(TlsError::General("reality: no ml-kem share in script".into()))?;
+
+        let public = x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let mut combined_pub = mlkem.pub_key().to_vec();
+        if combined_pub.len() != MLKEM768_ENCAP_LEN {
+            return Err(TlsError::General("reality: bad ml-kem public key length".into()));
+        }
+        combined_pub.extend_from_slice(&public);
+        let mlkem = match mlkem {
+            MlkemShare::PubOnly(_) => None,
+            MlkemShare::Active(kx) => Some(kx),
+        };
+        Ok(Box::new(ScriptedHybridKx {
+            x25519: ScriptedX25519Kx { secret, public },
+            mlkem,
+            combined_pub,
+        }))
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::X25519MLKEM768
+    }
+
+    fn usable_for_version(&self, version: rustls::ProtocolVersion) -> bool {
+        version == rustls::ProtocolVersion::TLSv1_3
+    }
+}
+
+impl ActiveKeyExchange for ScriptedHybridKx {
+    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> std::result::Result<SharedSecret, TlsError> {
+        if peer_pub_key.len() != MLKEM768_CIPHERTEXT_LEN + X25519_LEN {
+            return Err(TlsError::PeerMisbehaved(rustls::PeerMisbehaved::InvalidKeyShare));
+        }
+        let (ciphertext, x25519_peer) = peer_pub_key.split_at(MLKEM768_CIPHERTEXT_LEN);
+        let mlkem = self
+            .mlkem
+            .ok_or(TlsError::General("reality: ml-kem key not available in this pass".into()))?;
+        let pq = mlkem.complete(ciphertext)?;
+        let cl = Box::new(self.x25519).complete(x25519_peer)?;
+        let mut secret = pq.secret_bytes().to_vec();
+        secret.extend_from_slice(cl.secret_bytes());
+        Ok(SharedSecret::from(secret))
+    }
+
+    /// 让 rustls 在混合 share 之后再附一份独立的 x25519 share（同一把脚本私钥）。
+    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+        Some((NamedGroup::X25519, &self.x25519.public))
+    }
+
+    fn complete_hybrid_component(
+        self: Box<Self>,
+        peer_pub_key: &[u8],
+    ) -> std::result::Result<SharedSecret, TlsError> {
+        Box::new(self.x25519).complete(peer_pub_key)
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        &self.combined_pub
+    }
+
+    fn group(&self) -> NamedGroup {
+        NamedGroup::X25519MLKEM768
+    }
+}
+
 /// 以 aws-lc-rs 为底，仅替换 `secure_random` 与 `kx_groups` 的 provider。
-/// 限定纯 x25519：既是 Reality 的要求，也避开 rustls 默认优先的混合组分支。
+/// 混合组在前、x25519 在后：rustls 只为第一组调用 `start`，再经
+/// `hybrid_component` 附上 x25519 share——两份共用脚本私钥。
 pub(crate) fn reality_provider() -> CryptoProvider {
     CryptoProvider {
         secure_random: &SCRIPTED_RANDOM,
-        kx_groups: vec![&SCRIPTED_X25519 as &'static dyn SupportedKxGroup],
+        kx_groups: vec![
+            &SCRIPTED_X25519MLKEM768 as &'static dyn SupportedKxGroup,
+            &SCRIPTED_X25519 as &'static dyn SupportedKxGroup,
+        ],
         ..rustls::crypto::aws_lc_rs::default_provider()
     }
 }
@@ -177,6 +308,7 @@ pub(crate) fn reality_provider() -> CryptoProvider {
 fn with_script<T>(
     seed: [u8; 32],
     kx_secret: [u8; 32],
+    mlkem: MlkemShare,
     replace: Option<(usize, Vec<u8>)>,
     f: impl FnOnce() -> T,
 ) -> (T, Vec<Vec<u8>>) {
@@ -186,6 +318,7 @@ fn with_script<T>(
             calls: Vec::new(),
             replace,
             kx_secret,
+            mlkem: Some(mlkem),
         });
     });
     let out = f();
@@ -441,9 +574,10 @@ fn prepare(
     sni: rustls::pki_types::ServerName<'static>,
     seed: [u8; 32],
     kx_secret: [u8; 32],
+    mlkem_pub: Vec<u8>,
     unix_secs: u32,
 ) -> Result<Prepared> {
-    let (records, calls) = with_script(seed, kx_secret, None, || {
+    let (records, calls) = with_script(seed, kx_secret, MlkemShare::PubOnly(mlkem_pub), None, || {
         let mut conn = rustls::ClientConnection::new(client_config([0u8; 32]), sni)
             .map_err(|e| RError::Reality(format!("build ClientHello: {e}").into()))?;
         let mut out = Vec::new();
@@ -506,7 +640,8 @@ where
         .map_err(|_| RError::Reality("system clock before unix epoch".into()))?
         .as_secs() as u32;
 
-    let p = prepare(cfg, sni.clone(), seed, kx_secret, unix_secs)?;
+    let mlkem = new_mlkem()?;
+    let p = prepare(cfg, sni.clone(), seed, kx_secret, mlkem.pub_key().to_vec(), unix_secs)?;
 
     // B 趟：重放同一脚本，只把 session_id 那次取随机换成认证密文。
     // tokio-rustls 在 `connect()` 里同步构造 ClientConnection，所以脚本只需覆盖这一次调用。
@@ -514,6 +649,7 @@ where
     let (fut, calls) = with_script(
         p.seed,
         p.kx_secret,
+        MlkemShare::Active(mlkem),
         Some((p.session_id_call, p.session_id.to_vec())),
         || connector.connect(sni, tcp),
     );
@@ -548,12 +684,19 @@ mod tests {
     }
 
     /// 造一条 ClientConnection 并把它想发的 ClientHello 取出来（不上网）。
+    /// 测试里所有 ClientHello 共用一把 ML-KEM 公钥，等同于「同一条连接的两趟」。
+    fn test_mlkem_pub() -> Vec<u8> {
+        static PUB: OnceLock<Vec<u8>> = OnceLock::new();
+        PUB.get_or_init(|| new_mlkem().unwrap().pub_key().to_vec()).clone()
+    }
+
     fn emit_hello(
         seed: [u8; 32],
         kx_secret: [u8; 32],
         replace: Option<(usize, Vec<u8>)>,
     ) -> (Vec<u8>, Vec<Vec<u8>>) {
-        let (bytes, calls) = with_script(seed, kx_secret, replace, || {
+        let mlkem = MlkemShare::PubOnly(test_mlkem_pub());
+        let (bytes, calls) = with_script(seed, kx_secret, mlkem, replace, || {
             let name = ServerName::try_from("www.microsoft.com").unwrap();
             let mut conn = ClientConnection::new(test_config(), name).unwrap();
             let mut out = Vec::new();
@@ -561,6 +704,124 @@ mod tests {
             out
         });
         (client_hello_body(&bytes).unwrap(), calls)
+    }
+
+    /// 取 ClientHello 的 key_share 扩展，按出现顺序返回 (group, key_exchange)。
+    fn key_shares(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let u16_at = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+        // type(1) len(3) legacy_version(2) random(32)
+        let mut i = 4 + 2 + RANDOM_LEN;
+        i += 1 + hello[i] as usize; // legacy_session_id
+        i += 2 + u16_at(hello, i); // cipher_suites
+        i += 1 + hello[i] as usize; // legacy_compression_methods
+        let ext_end = i + 2 + u16_at(hello, i);
+        i += 2;
+        while i < ext_end {
+            let (ty, len) = (u16_at(hello, i), u16_at(hello, i + 2));
+            let data = &hello[i + 4..i + 4 + len];
+            if ty == 0x0033 {
+                let mut out = Vec::new();
+                let mut j = 2;
+                while j < data.len() {
+                    let (group, klen) = (u16_at(data, j) as u16, u16_at(data, j + 2));
+                    out.push((group, data[j + 4..j + 4 + klen].to_vec()));
+                    j += 4 + klen;
+                }
+                return out;
+            }
+            i += 4 + len;
+        }
+        Vec::new()
+    }
+
+    /// 逐行移植 XTLS/REALITY `tls.go`（83f62178，xray v26.10.21）里服务端挑选
+    /// 客户端 x25519 公钥的循环。返回 None 即服务端放弃认证、转给伪装站。
+    fn reality_server_peer_pub(shares: &[(u16, Vec<u8>)]) -> Option<Vec<u8>> {
+        const X25519: u16 = 0x001d;
+        const X25519MLKEM768: u16 = 0x11ec;
+        const MLKEM768_ENCAP_LEN: usize = 1184;
+        let (mut peer_pub, mut peer_pub2): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+        for (group, data) in shares {
+            if *group == X25519MLKEM768 && data.len() == MLKEM768_ENCAP_LEN + 32 {
+                if peer_pub2.is_some() {
+                    peer_pub2 = None;
+                    break;
+                }
+                peer_pub2 = Some(data[MLKEM768_ENCAP_LEN..].to_vec());
+                continue;
+            }
+            if *group == X25519 && data.len() == 32 {
+                if peer_pub.is_some() {
+                    peer_pub2 = None;
+                    break;
+                }
+                peer_pub = Some(data.clone());
+                break;
+            }
+        }
+        let peer_pub2 = peer_pub2?; // reject Client Hello without X25519MLKEM768 before X25519
+        Some(peer_pub.unwrap_or(peer_pub2))
+    }
+
+    /// xray v26.9.8 起（REALITY 8cdf7bf9）服务端拒绝没有「X25519MLKEM768 在前、
+    /// 可选 X25519 在后」key_share 的 ClientHello。我们发出的必须过这道判定，
+    /// 且服务端取到的 x25519 公钥必须是脚本私钥对应的那把——否则 auth_key 对不上。
+    #[test]
+    fn key_shares_pass_reality_server_selection() {
+        let secret = [9u8; 32];
+        let expect = x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let (hello, _) = emit_hello([7u8; 32], secret, None);
+        let shares = key_shares(&hello);
+        let groups: Vec<u16> = shares.iter().map(|(g, _)| *g).collect();
+        assert_eq!(groups, vec![0x11ec, 0x001d], "key_share 顺序必须是 X25519MLKEM768, X25519");
+        assert_eq!(&shares[0].1[1184..], &expect[..], "混合 share 的 x25519 部分必须是脚本公钥");
+        assert_eq!(
+            reality_server_peer_pub(&shares).as_deref(),
+            Some(&expect[..]),
+            "REALITY 服务端会拒绝这个 ClientHello，或取到别的 x25519 公钥"
+        );
+    }
+
+    /// 在 B 趟脚本下起一个混合 key share（持有真正的 ML-KEM 密钥）。
+    fn start_active_hybrid(secret: [u8; 32]) -> Box<dyn ActiveKeyExchange> {
+        let mlkem = MlkemShare::Active(new_mlkem().unwrap());
+        let (kx, _) = with_script([7u8; 32], secret, mlkem, None, || SCRIPTED_X25519MLKEM768.start());
+        kx.unwrap()
+    }
+
+    /// 服务端选混合组：用 rustls 自带的 X25519MLKEM768 扮演服务端封装，双方共享密钥必须相同。
+    #[test]
+    fn hybrid_key_exchange_agrees_with_server() {
+        use rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768;
+
+        let kx = start_active_hybrid([9u8; 32]);
+        assert_eq!(kx.pub_key().len(), MLKEM768_ENCAP_LEN + X25519_LEN);
+        let server = X25519MLKEM768.start_and_complete(kx.pub_key()).unwrap();
+        let client = kx.complete(&server.pub_key).unwrap();
+        assert_eq!(client.secret_bytes(), server.secret.secret_bytes());
+    }
+
+    /// 服务端选独立的 x25519 share：走 complete_hybrid_component，密钥同样一致。
+    #[test]
+    fn x25519_component_agrees_with_server() {
+        use rustls::crypto::aws_lc_rs::kx_group::X25519;
+
+        let kx = start_active_hybrid([9u8; 32]);
+        let (group, share) = kx.hybrid_component().unwrap();
+        assert_eq!(group, NamedGroup::X25519);
+        let server = X25519.start_and_complete(share).unwrap();
+        let client = kx.complete_hybrid_component(&server.pub_key).unwrap();
+        assert_eq!(client.secret_bytes(), server.secret.secret_bytes());
+    }
+
+    /// A 趟的混合 share 没有 ML-KEM 私钥，误走到 complete 必须报错而不是算出错误密钥。
+    #[test]
+    fn pub_only_hybrid_refuses_to_complete() {
+        let (kx, _) = with_script([7u8; 32], [9u8; 32], MlkemShare::PubOnly(test_mlkem_pub()), None, || {
+            SCRIPTED_X25519MLKEM768.start()
+        });
+        let peer = vec![0u8; MLKEM768_CIPHERTEXT_LEN + X25519_LEN];
+        assert!(kx.unwrap().complete(&peer).is_err());
     }
 
     /// 明文布局逐字段对照 xray 服务端 `tls.go` 的解析。
@@ -644,7 +905,7 @@ mod tests {
         let now = 1_800_000_000u32;
 
         let sni = ServerName::try_from(cfg.server_name.clone()).unwrap();
-        let p = prepare(&cfg, sni, seed, kx_secret, now).unwrap();
+        let p = prepare(&cfg, sni, seed, kx_secret, test_mlkem_pub(), now).unwrap();
 
         // B 趟真正发出去的 ClientHello
         let (hello, _) = emit_hello(seed, kx_secret, Some((p.session_id_call, p.session_id.to_vec())));
