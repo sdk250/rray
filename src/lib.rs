@@ -6,3 +6,4 @@ pub mod outbound;
 pub mod relay;
 pub mod driver;
 pub mod ext;
+pub mod service;
