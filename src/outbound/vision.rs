@@ -256,34 +256,68 @@ impl Padder {
         xtls_padding(&[], CMD_PADDING_CONTINUE, self.uuid.take().as_ref(), true)
     }
 
-    /// 给一次写入加帧，返回真正要写进 TLS 流的字节。对照 xray `VisionWriter.WriteMultiBuffer`。
+    /// 给一次写入加帧，返回真正要写进 TLS 流的字节。对照 xray `VisionWriter.WriteMultiBuffer`：
+    /// 先按 `ReshapeMultiBuffer` 拆块，逐块成帧；padding 若在这批里结束，结束命令落在最后一帧。
     pub(crate) fn pad(&mut self, data: &[u8], ts: &mut TrafficState) -> Vec<u8> {
         ts.filter(data);
         if !self.padding {
             return data.to_vec();
         }
 
-        let long_padding = ts.is_tls;
-        let (command, long_padding) = if ts.is_tls
-            && data.len() >= 6
-            && data[..3] == TLS_APPLICATION_DATA_START
-            && is_complete_record(data)
-        {
-            // 内层握手结束：TLS 1.3 发 Direct（之后上行写裸 socket），否则发 End。
-            self.padding = false;
-            self.direct = ts.enable_xtls;
-            let command = if ts.enable_xtls { CMD_PADDING_DIRECT } else { CMD_PADDING_END };
-            (command, true)
-        } else if !ts.is_tls12_or_above && ts.filter_budget <= 1 {
-            // 不是 TLS 1.2+：嗅探名额快用完就提前结束（xray："finish padding 1 packet early"）。
-            self.padding = false;
-            (CMD_PADDING_END, long_padding)
-        } else {
-            (CMD_PADDING_CONTINUE, long_padding)
+        let end_command = |ts: &TrafficState| {
+            if ts.enable_xtls { CMD_PADDING_DIRECT } else { CMD_PADDING_END }
         };
+        let is_complete = is_complete_record(data);
+        let pieces = reshape(data);
+        let last = pieces.len() - 1;
+        let mut long_padding = ts.is_tls;
+        let mut out = Vec::with_capacity(data.len() + pieces.len() * (UUID_LEN + HEADER_LEN + 256));
 
-        xtls_padding(data, command, self.uuid.take().as_ref(), long_padding)
+        for (i, b) in pieces.iter().enumerate() {
+            if ts.is_tls && b.len() >= 6 && b[..3] == TLS_APPLICATION_DATA_START && is_complete {
+                // 内层握手结束：TLS 1.3 发 Direct（之后上行写裸 socket），否则发 End。
+                self.padding = false;
+                self.direct = ts.enable_xtls;
+                let command = if i == last { end_command(ts) } else { CMD_PADDING_CONTINUE };
+                out.extend_from_slice(&xtls_padding(b, command, self.uuid.take().as_ref(), true));
+                long_padding = false;
+                continue;
+            } else if !ts.is_tls12_or_above && ts.filter_budget <= 1 {
+                // 不是 TLS 1.2+：嗅探名额快用完就提前结束（xray："finish padding 1 packet early"）。
+                // 这批余下的块不再成帧，对端收到 End 后原样透传。
+                self.padding = false;
+                out.extend_from_slice(&xtls_padding(b, CMD_PADDING_END, self.uuid.take().as_ref(), long_padding));
+                for rest in &pieces[i + 1..] {
+                    out.extend_from_slice(rest);
+                }
+                break;
+            }
+            let command = if i == last && !self.padding { end_command(ts) } else { CMD_PADDING_CONTINUE };
+            out.extend_from_slice(&xtls_padding(b, command, self.uuid.take().as_ref(), long_padding));
+        }
+        out
     }
+}
+
+/// 把一次写入拆成单帧装得下的块。对照 xray `ReshapeMultiBuffer`：长度 ≥ `buf.Size - 21`
+/// 的块要拆，拆点优先取块内最后一个 application_data 记录头（不落在 [21, buf.Size - 21]
+/// 之外），否则取 `buf.Size / 2`。xray 的块最大 8KB 只拆一刀，我们的写入可能有 64KB，循环拆。
+fn reshape(data: &[u8]) -> Vec<&[u8]> {
+    let mut pieces = Vec::with_capacity(data.len() / (BUF_SIZE / 2) + 1);
+    let mut rest = data;
+    while rest.len() >= MAX_FRAME_CONTENT {
+        let window = &rest[..(MAX_FRAME_CONTENT + TLS_APPLICATION_DATA_START.len()).min(rest.len())];
+        let at = window
+            .windows(TLS_APPLICATION_DATA_START.len())
+            .rposition(|w| w == TLS_APPLICATION_DATA_START)
+            .filter(|i| (UUID_LEN + HEADER_LEN..=MAX_FRAME_CONTENT).contains(i))
+            .unwrap_or(BUF_SIZE / 2);
+        let (head, tail) = rest.split_at(at);
+        pieces.push(head);
+        rest = tail;
+    }
+    pieces.push(rest);
+    pieces
 }
 
 /// 判断这批字节是否恰好是若干个完整的 application_data 记录
@@ -762,6 +796,75 @@ mod tests {
 
         assert_eq!(p.pad(&app_data(), &mut ts)[0], CMD_PADDING_END);
         assert!(p.padding_done() && !p.wants_direct());
+    }
+
+    /// 逐帧解析：返回每帧的 (command, content)。
+    fn frames(mut wire: &[u8], first_has_uuid: bool) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        if first_has_uuid {
+            wire = &wire[UUID_LEN..];
+        }
+        while !wire.is_empty() {
+            let (cmd, clen, plen) = (
+                wire[0],
+                u16::from_be_bytes([wire[1], wire[2]]) as usize,
+                u16::from_be_bytes([wire[3], wire[4]]) as usize,
+            );
+            assert!(HEADER_LEN + UUID_LEN + clen + plen <= BUF_SIZE, "帧超出 xray buf.Size");
+            out.push((cmd, wire[HEADER_LEN..HEADER_LEN + clen].to_vec()));
+            wire = &wire[HEADER_LEN + clen + plen..];
+        }
+        out
+    }
+
+    /// 大块写入要按 xray `ReshapeMultiBuffer` 拆成多帧：每帧内容 < buf.Size - 21，
+    /// 否则 64KB 的写入会让 u16 的 contentLen 溢出。
+    #[test]
+    fn large_write_is_reshaped_into_frames() {
+        for size in [8171, 8192, 20_000, 65_536] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+            let wire = p.pad(&data, &mut ts);
+
+            let fs = frames(&wire, true);
+            assert!(fs.len() >= 2, "size {size} 没被拆开");
+            assert!(fs.iter().all(|(cmd, c)| *cmd == CMD_PADDING_CONTINUE && c.len() <= MAX_FRAME_CONTENT));
+            assert_eq!(fs.concat_content(), data, "size {size}");
+        }
+    }
+
+    /// 拆分点优先落在 application_data 记录头上；整批的最后一帧才带 Direct。
+    #[test]
+    fn reshape_splits_at_record_boundaries_and_ends_on_last_frame() {
+        let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+        p.pad(&client_hello(), &mut ts);
+        ts.filter(&server_hello(0x1301, true));
+
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&[0x17, 0x03, 0x03]);
+            data.extend_from_slice(&5000u16.to_be_bytes());
+            data.extend_from_slice(&[0x42; 5000]);
+        }
+        let fs = frames(&p.pad(&data, &mut ts), false);
+
+        assert!(fs.len() >= 2);
+        assert!(fs.iter().all(|(_, c)| c[..3] == TLS_APPLICATION_DATA_START), "拆在了记录中间");
+        let (last, init) = fs.split_last().unwrap();
+        assert!(init.iter().all(|(cmd, _)| *cmd == CMD_PADDING_CONTINUE));
+        assert_eq!(last.0, CMD_PADDING_DIRECT);
+        assert!(p.wants_direct());
+        assert_eq!(fs.concat_content(), data);
+    }
+
+    trait ConcatContent {
+        fn concat_content(&self) -> Vec<u8>;
+    }
+
+    impl ConcatContent for Vec<(u8, Vec<u8>)> {
+        fn concat_content(&self) -> Vec<u8> {
+            self.iter().flat_map(|(_, c)| c.clone()).collect()
+        }
     }
 
     /// application_data 记录不完整时不能结束 padding（长度字段说还有更多字节）。
