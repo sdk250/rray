@@ -80,13 +80,16 @@ pub(crate) fn xtls_padding(
 pub(crate) struct Unpadder {
     /// 是否还没吃掉服务端第一帧的 UUID 前缀。
     expect_uuid: bool,
-    /// 已进入直通：不再解帧，字节原样交付。
+    /// 已收到 `End` 或 `Direct`：padding 结束，不再解帧，字节原样交付。
+    done: bool,
+    /// 收到的是 `Direct`：服务端此后越过 TLS 直写裸 TCP，读端也要跟着切。
+    /// `End` 不会置它 —— 之后的数据仍是 TLS 记录（xray `proxy.go`：命令 1 只结束 padding）。
     direct: bool,
 }
 
 impl Unpadder {
     pub(crate) fn new() -> Self {
-        Self { expect_uuid: true, direct: false }
+        Self { expect_uuid: true, done: false, direct: false }
     }
 
     pub(crate) fn is_direct(&self) -> bool {
@@ -95,10 +98,10 @@ impl Unpadder {
 
     /// 尽可能从 `buf` 里解出数据追加到 `out`。
     /// 不足一整帧就原样留在 `buf` 里等更多字节。
-    /// 收到 `End`/`Direct` 命令后切直通，其后的字节直接透传。
+    /// 收到 `End`/`Direct` 命令后不再解帧，其后的字节直接透传。
     pub(crate) fn unpad(&mut self, buf: &mut BytesMut, out: &mut Vec<u8>) -> Result<()> {
         loop {
-            if self.direct {
+            if self.done {
                 out.extend_from_slice(buf);
                 buf.clear();
                 return Ok(());
@@ -126,7 +129,11 @@ impl Unpadder {
             tracing::debug!(command, content_len, pad_len, "vision frame in");
             match command {
                 CMD_PADDING_CONTINUE => {},
-                CMD_PADDING_END | CMD_PADDING_DIRECT => self.direct = true,
+                CMD_PADDING_END => self.done = true,
+                CMD_PADDING_DIRECT => {
+                    self.done = true;
+                    self.direct = true;
+                },
                 _ => return Err(RError::Protocol("unknown vision padding command".into())),
             }
         }
@@ -471,7 +478,7 @@ mod tests {
         let framed = xtls_padding(b"abc", CMD_PADDING_END, None, false);
         let mut buf = BytesMut::from(&framed[..framed.len() - 1]); // 缺最后一字节
         let mut out = Vec::new();
-        let mut u = Unpadder { expect_uuid: false, direct: false };
+        let mut u = Unpadder::default();
         u.unpad(&mut buf, &mut out).unwrap();
         assert!(out.is_empty());
         assert!(!u.is_direct());
@@ -480,21 +487,22 @@ mod tests {
         buf.extend_from_slice(&framed[framed.len() - 1..]);
         u.unpad(&mut buf, &mut out).unwrap();
         assert_eq!(out, b"abc");
-        assert!(u.is_direct());
+        assert!(u.done);
+        assert!(!u.is_direct());
     }
 
-    /// 收到 End 后剩余字节原样透传，不再当帧解析。
+    /// 收到 End 后剩余字节原样透传，不再当帧解析；但不切裸 socket。
     #[test]
-    fn end_switches_to_direct_passthrough() {
+    fn end_stops_unpadding_passthrough() {
         let mut framed = xtls_padding(b"last", CMD_PADDING_END, None, false);
         framed.extend_from_slice(b"raw bytes after end");
 
         let mut buf = BytesMut::from(&framed[..]);
         let mut out = Vec::new();
-        let mut u = Unpadder { expect_uuid: false, direct: false };
+        let mut u = Unpadder::default();
         u.unpad(&mut buf, &mut out).unwrap();
         assert_eq!(out, b"lastraw bytes after end");
-        assert!(u.is_direct());
+        assert!(!u.is_direct());
         assert!(buf.is_empty());
     }
 
@@ -503,7 +511,7 @@ mod tests {
         let framed = xtls_padding(b"x", 0x7F, None, false);
         let mut buf = BytesMut::from(&framed[..]);
         let mut out = Vec::new();
-        let mut u = Unpadder { expect_uuid: false, direct: false };
+        let mut u = Unpadder::default();
         assert!(u.unpad(&mut buf, &mut out).is_err());
     }
 
@@ -708,6 +716,98 @@ mod tests {
         app_data.extend_from_slice(&[0x42u8; 8]);
         vs.write_all(&app_data).await.unwrap();
         assert!(vs.padder.is_direct());
+    }
+
+    /// 测试替身：区分"经 TLS 读"（`tls`）与"越过 TLS 读裸 socket"（`raw`）。
+    struct SplitInner {
+        tls: tokio::io::DuplexStream,
+        raw: tokio::io::DuplexStream,
+    }
+
+    impl tokio::io::AsyncRead for SplitInner {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.tls).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for SplitInner {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.tls).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.tls).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.tls).poll_shutdown(cx)
+        }
+    }
+
+    impl super::super::record_gate::DirectSwitch for SplitInner {
+        fn poll_read_direct(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.raw), cx, buf)
+        }
+    }
+
+    /// 读满 `want` 字节；超时说明读错了来源。
+    async fn read_n<R: tokio::io::AsyncRead + Unpin>(r: &mut R, want: usize) -> Vec<u8> {
+        let mut got = vec![0u8; want];
+        tokio::time::timeout(std::time::Duration::from_secs(2), r.read_exact(&mut got))
+            .await
+            .expect("读超时：数据没从预期的来源到达")
+            .unwrap();
+        got
+    }
+
+    /// `End` 只结束 padding，之后的数据**仍然经 TLS 读**（xray `proxy.go`：
+    /// 命令 1 只置 `withinPaddingBuffers = false`）。明文 HTTP、内层 TLS 1.2 走这条路。
+    #[tokio::test]
+    async fn end_keeps_reading_through_tls() {
+        let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
+        let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+
+        tls_peer.write_all(&xtls_padding(b"hello", CMD_PADDING_END, Some(&UUID), false)).await.unwrap();
+        assert_eq!(read_n(&mut vs, 5).await, b"hello");
+        assert!(!vs.unpadder.is_direct());
+
+        // 之后的数据在后续 TLS 记录里到达；裸 socket 上的字节不该被读到。
+        raw_peer.write_all(b"WRONG: raw socket bytes").await.unwrap();
+        tls_peer.write_all(b" after end via tls").await.unwrap();
+        assert_eq!(read_n(&mut vs, 18).await, b" after end via tls");
+    }
+
+    /// `Direct` 才切到越过 TLS 直接读裸 socket。
+    #[tokio::test]
+    async fn direct_switches_to_raw_socket() {
+        let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
+        let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+
+        tls_peer.write_all(&xtls_padding(b"hello", CMD_PADDING_DIRECT, Some(&UUID), false)).await.unwrap();
+        raw_peer.write_all(b" raw tail").await.unwrap();
+
+        assert_eq!(read_n(&mut vs, 14).await, b"hello raw tail");
+        assert!(vs.unpadder.is_direct());
     }
 
     /// padding 长度必须落在 xray 的公式范围内，且不越 buf.Size 上限。
