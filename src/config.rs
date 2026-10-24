@@ -21,6 +21,8 @@ pub struct LogCfg {
 pub struct InboundCfg {
     pub listen: IpAddr,
     pub port: u16,
+    /// 同时处理的连接上限，0 表示不限。
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +78,13 @@ struct RawLog {
 struct RawInbound {
     listen: IpAddr,
     port: u16,
+    #[serde(default = "default_max_connections")]
+    max_connections: usize,
+}
+
+/// 每条连接占两个 fd（入站 + 出站）；1024 条对本地代理绰绰有余，又远离常见的 fd 上限。
+fn default_max_connections() -> usize {
+    1024
 }
 
 #[derive(Deserialize)]
@@ -193,7 +202,11 @@ impl TryFrom<RawConfig> for Config {
     fn try_from(r: RawConfig) -> Result<Config> {
         Ok(Config {
             log: LogCfg { level: r.log.level },
-            inbound: InboundCfg { listen: r.inbound.listen, port: r.inbound.port },
+            inbound: InboundCfg {
+                listen: r.inbound.listen,
+                port: r.inbound.port,
+                max_connections: r.inbound.max_connections,
+            },
             outbound: OutboundCfg {
                 server: r.outbound.server,
                 port: r.outbound.port,
@@ -219,8 +232,12 @@ impl TryFrom<RawConfig> for Config {
 }
 
 pub fn load(path: &str) -> Result<Config> {
-    let text = std::fs::read_to_string(path)?;
-    let raw: RawConfig = toml::from_str(&text).map_err(|e| describe_toml_error(&e, &text))?;
+    parse(&std::fs::read_to_string(path)?)
+}
+
+/// 解析配置文本。出错信息不回显原文，见 [`describe_toml_error`]。
+pub fn parse(text: &str) -> Result<Config> {
+    let raw: RawConfig = toml::from_str(text).map_err(|e| describe_toml_error(&e, text))?;
     raw.try_into()
 }
 
@@ -394,6 +411,16 @@ dial_retries = 2
         assert_eq!(cfg.timeout.connect_ms, 1500);
         assert_eq!(cfg.timeout.handshake_ms, 5000);
         assert_eq!(cfg.timeout.dial_retries, 1);
+    }
+
+    /// max_connections 可省略，默认 1024；0 表示不限。
+    #[test]
+    fn max_connections_defaults_and_overrides() {
+        let cfg = parse(SAMPLE).unwrap();
+        assert_eq!(cfg.inbound.max_connections, 1024);
+
+        let text = SAMPLE.replace("port = 1080", "port = 1080\nmax_connections = 0");
+        assert_eq!(parse(&text).unwrap().inbound.max_connections, 0);
     }
 
     #[test]

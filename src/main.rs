@@ -1,15 +1,12 @@
 use std::sync::Arc;
 
-use tracing::{ error, info, warn };
-use tokio::{
-    net::TcpListener,
-    time::{ sleep, Duration }
-};
+use tracing::{ error, info };
+use tokio::net::TcpListener;
 
 use rray::config::{ self, Config };
 use rray::error::Result;
 use rray::ext::{ logger_service, parse_level };
-use rray::driver::handle_connection;
+use rray::driver;
 
 
 const CONFIG_PATH: &str = "config.toml";
@@ -19,24 +16,8 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     let listener = TcpListener::bind((cfg.inbound.listen, cfg.inbound.port)).await?;
     info!("SOCKS5 listening on {}:{}", cfg.inbound.listen, cfg.inbound.port);
     info!("outbound {}:{} (sni {})", cfg.outbound.server, cfg.outbound.port, cfg.outbound.reality.server_name);
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let cfg = cfg.clone();
-                // 每条连接独立 spawn：单连接的错误不影响其它连接。
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, cfg).await {
-                        warn!("connection from {} failed: {}", peer_addr, e);
-                    }
-                });
-            },
-            Err(e) => {
-                error!("failed to accept connection: {}", e);
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
+    driver::serve(listener, cfg).await;
+    Ok(())
 }
 
 #[tokio::main]
