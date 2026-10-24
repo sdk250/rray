@@ -42,7 +42,6 @@ pub struct RealityCfg {
     pub public_key: [u8; 32],
     pub short_id: Vec<u8>,
     pub server_name: String,
-    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +54,7 @@ pub struct TimeoutCfg {
 // ---- 原始可反序列化结构（贴近 TOML） ----
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     log: RawLog,
     inbound: RawInbound,
@@ -63,17 +63,20 @@ struct RawConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLog {
     level: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawInbound {
     listen: IpAddr,
     port: u16,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawOutbound {
     server: String,
     port: u16,
@@ -82,21 +85,22 @@ struct RawOutbound {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawVless {
     uuid: String,
     flow: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawReality {
     public_key: String,
     short_id: String,
     server_name: String,
-    #[serde(default)]
-    fingerprint: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTimeout {
     connect_ms: u64,
     handshake_ms: u64,
@@ -188,7 +192,6 @@ impl TryFrom<RawConfig> for Config {
                     public_key: parse_pubkey_b64(&r.outbound.reality.public_key)?,
                     short_id: parse_hex(&r.outbound.reality.short_id)?,
                     server_name: r.outbound.reality.server_name,
-                    fingerprint: r.outbound.reality.fingerprint,
                 },
             },
             timeout: TimeoutCfg {
@@ -344,6 +347,17 @@ dial_retries = 2
     #[test]
     fn rejects_short_pubkey() {
         assert!(parse_pubkey_b64("MC4CAQAwBQYDK2VuBCIEIA==").is_err());
+    }
+
+    /// 未知字段（拼错的、已移除的如 `fingerprint`）要报错，不能静默忽略。
+    #[test]
+    fn rejects_unknown_field() {
+        let text = SAMPLE.replace(
+            "server_name = \"www.microsoft.com\"",
+            "server_name = \"www.microsoft.com\"\nfingerprint = \"chrome\"",
+        );
+        let err = toml::from_str::<RawConfig>(&text).err().expect("unknown field accepted");
+        assert!(err.message().contains("fingerprint"), "{}", err.message());
     }
 
     #[test]

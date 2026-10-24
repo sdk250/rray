@@ -553,6 +553,8 @@ fn client_config(auth_key: [u8; 32]) -> std::sync::Arc<rustls::ClientConfig> {
         .with_no_client_auth();
     // xray 设 SessionTicketsDisabled：会话恢复会让 ClientHello 带上 PSK，破坏两趟的确定性。
     cfg.resumption = rustls::client::Resumption::disabled();
+    // 与浏览器同形
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     std::sync::Arc::new(cfg)
 }
 
@@ -707,9 +709,12 @@ mod tests {
         (client_hello_body(&bytes).unwrap(), calls)
     }
 
-    /// 取 ClientHello 的 key_share 扩展，按出现顺序返回 (group, key_exchange)。
-    fn key_shares(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
-        let u16_at = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+    fn u16_at(b: &[u8], i: usize) -> usize {
+        u16::from_be_bytes([b[i], b[i + 1]]) as usize
+    }
+
+    /// 取 ClientHello 里类型为 `ty` 的扩展数据。
+    fn extension(hello: &[u8], ty: u16) -> Option<&[u8]> {
         // type(1) len(3) legacy_version(2) random(32)
         let mut i = 4 + 2 + RANDOM_LEN;
         i += 1 + hello[i] as usize; // legacy_session_id
@@ -718,21 +723,37 @@ mod tests {
         let ext_end = i + 2 + u16_at(hello, i);
         i += 2;
         while i < ext_end {
-            let (ty, len) = (u16_at(hello, i), u16_at(hello, i + 2));
-            let data = &hello[i + 4..i + 4 + len];
-            if ty == 0x0033 {
-                let mut out = Vec::new();
-                let mut j = 2;
-                while j < data.len() {
-                    let (group, klen) = (u16_at(data, j) as u16, u16_at(data, j + 2));
-                    out.push((group, data[j + 4..j + 4 + klen].to_vec()));
-                    j += 4 + klen;
-                }
-                return out;
+            let len = u16_at(hello, i + 2);
+            if u16_at(hello, i) == ty as usize {
+                return Some(&hello[i + 4..i + 4 + len]);
             }
             i += 4 + len;
         }
-        Vec::new()
+        None
+    }
+
+    /// 取 ClientHello 的 key_share 扩展，按出现顺序返回 (group, key_exchange)。
+    fn key_shares(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let Some(data) = extension(hello, 0x0033) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut j = 2;
+        while j < data.len() {
+            let (group, klen) = (u16_at(data, j) as u16, u16_at(data, j + 2));
+            out.push((group, data[j + 4..j + 4 + klen].to_vec()));
+            j += 4 + klen;
+        }
+        out
+    }
+
+    /// 真浏览器访问 HTTPS 一定带 ALPN；缺了它本身就是指纹特征。
+    #[test]
+    fn client_hello_offers_browser_alpn() {
+        let (hello, _) = emit_hello([0x11; 32], [0x22; 32], None);
+        let alpn = extension(&hello, 0x0010).expect("ClientHello has no ALPN extension");
+        // protocol_name_list: len(2) | (len(1) name)*
+        assert_eq!(alpn, b"\x00\x0c\x02h2\x08http/1.1");
     }
 
     /// 逐行移植 XTLS/REALITY `tls.go`（83f62178，xray v26.10.21）里服务端挑选
@@ -899,7 +920,6 @@ mod tests {
             public_key: server_public,
             short_id: vec![0x01, 0x23, 0xab, 0xcd],
             server_name: "www.microsoft.com".into(),
-            fingerprint: None,
         };
         let seed = [0x11u8; 32];
         let kx_secret = [0x22u8; 32];
