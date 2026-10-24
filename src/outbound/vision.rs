@@ -9,7 +9,7 @@
 //! `Direct`，此后该方向越过外层 TLS 直写裸 TCP；否则发 `End`，此后不加 padding
 //! 但仍走外层 TLS。非 TLS 流量在嗅探名额快用完时提前 `End`。
 
-use bytes::{ Buf, BytesMut };
+use bytes::{ Buf, BufMut, BytesMut };
 
 use crate::error::{ Result, RError };
 
@@ -38,6 +38,8 @@ const XTLS_CIPHERS: std::ops::RangeInclusive<u16> = 0x1301..=0x1304;
 const FILTER_PACKETS: i32 = 8;
 const TLS_RECORD_HEADER_LEN: usize = 5;
 
+/// padding 阶段每次从 TLS 读的块大小（一条 TLS 记录的明文上限）。
+const READ_CHUNK: usize = 16 * 1024;
 /// xray 的 `buf.Size`，padding 上限按它算。
 const BUF_SIZE: usize = 8192;
 /// 单帧内容上限：xray `ReshapeMultiBuffer` 会把 ≥ `buf.Size - 21` 的 buffer 拆开。
@@ -74,17 +76,28 @@ pub(crate) fn xtls_padding(
     uuid: Option<&[u8; 16]>,
     long_padding: bool,
 ) -> Vec<u8> {
-    let pad = padding_len(data.len(), long_padding);
-    let mut out = Vec::with_capacity(UUID_LEN + HEADER_LEN + data.len() + pad);
-    if let Some(id) = uuid {
-        out.extend_from_slice(id);
-    }
-    out.push(command);
-    out.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    out.extend_from_slice(&(pad as u16).to_be_bytes());
-    out.extend_from_slice(data);
-    out.resize(out.len() + pad, 0);
+    let mut out = Vec::new();
+    xtls_padding_into(&mut out, data, command, uuid, long_padding);
     out
+}
+
+/// 同 [`xtls_padding`]，直接追加进 `out`，省一次分配和拷贝。
+fn xtls_padding_into(
+    out: &mut impl BufMut,
+    data: &[u8],
+    command: u8,
+    uuid: Option<&[u8; 16]>,
+    long_padding: bool,
+) {
+    let pad = padding_len(data.len(), long_padding);
+    if let Some(id) = uuid {
+        out.put_slice(id);
+    }
+    out.put_u8(command);
+    out.put_u16(data.len() as u16);
+    out.put_u16(pad as u16);
+    out.put_slice(data);
+    out.put_bytes(0, pad);
 }
 
 /// 解帧状态机。对应 xray `XtlsUnpadding` 的三个 remaining 计数器。
@@ -115,10 +128,10 @@ impl Unpadder {
     /// 尽可能从 `buf` 里解出数据追加到 `out`。
     /// 不足一整帧就原样留在 `buf` 里等更多字节。
     /// 收到 `End`/`Direct` 命令后不再解帧，其后的字节直接透传。
-    pub(crate) fn unpad(&mut self, buf: &mut BytesMut, out: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn unpad(&mut self, buf: &mut BytesMut, out: &mut impl BufMut) -> Result<()> {
         loop {
             if self.done {
-                out.extend_from_slice(buf);
+                out.put_slice(buf);
                 buf.clear();
                 return Ok(());
             }
@@ -139,7 +152,7 @@ impl Unpadder {
 
             buf.advance(prefix + HEADER_LEN);
             self.expect_uuid = false;
-            out.extend_from_slice(&buf[..content_len]);
+            out.put_slice(&buf[..content_len]);
             buf.advance(content_len + pad_len);
 
             tracing::debug!(command, content_len, pad_len, "vision frame in");
@@ -256,12 +269,20 @@ impl Padder {
         xtls_padding(&[], CMD_PADDING_CONTINUE, self.uuid.take().as_ref(), true)
     }
 
-    /// 给一次写入加帧，返回真正要写进 TLS 流的字节。对照 xray `VisionWriter.WriteMultiBuffer`：
-    /// 先按 `ReshapeMultiBuffer` 拆块，逐块成帧；padding 若在这批里结束，结束命令落在最后一帧。
+    /// 给一次写入加帧，返回真正要写进 TLS 流的字节。
     pub(crate) fn pad(&mut self, data: &[u8], ts: &mut TrafficState) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() + UUID_LEN + HEADER_LEN + 1024);
+        self.pad_into(data, ts, &mut out);
+        out
+    }
+
+    /// 给一次写入加帧，追加进 `out`。对照 xray `VisionWriter.WriteMultiBuffer`：
+    /// 先按 `ReshapeMultiBuffer` 拆块，逐块成帧；padding 若在这批里结束，结束命令落在最后一帧。
+    pub(crate) fn pad_into(&mut self, data: &[u8], ts: &mut TrafficState, out: &mut impl BufMut) {
         ts.filter(data);
         if !self.padding {
-            return data.to_vec();
+            out.put_slice(data);
+            return;
         }
 
         let end_command = |ts: &TrafficState| {
@@ -271,7 +292,6 @@ impl Padder {
         let pieces = reshape(data);
         let last = pieces.len() - 1;
         let mut long_padding = ts.is_tls;
-        let mut out = Vec::with_capacity(data.len() + pieces.len() * (UUID_LEN + HEADER_LEN + 256));
 
         for (i, b) in pieces.iter().enumerate() {
             if ts.is_tls && b.len() >= 6 && b[..3] == TLS_APPLICATION_DATA_START && is_complete {
@@ -279,23 +299,22 @@ impl Padder {
                 self.padding = false;
                 self.direct = ts.enable_xtls;
                 let command = if i == last { end_command(ts) } else { CMD_PADDING_CONTINUE };
-                out.extend_from_slice(&xtls_padding(b, command, self.uuid.take().as_ref(), true));
+                xtls_padding_into(out, b, command, self.uuid.take().as_ref(), true);
                 long_padding = false;
                 continue;
             } else if !ts.is_tls12_or_above && ts.filter_budget <= 1 {
                 // 不是 TLS 1.2+：嗅探名额快用完就提前结束（xray："finish padding 1 packet early"）。
                 // 这批余下的块不再成帧，对端收到 End 后原样透传。
                 self.padding = false;
-                out.extend_from_slice(&xtls_padding(b, CMD_PADDING_END, self.uuid.take().as_ref(), long_padding));
+                xtls_padding_into(out, b, CMD_PADDING_END, self.uuid.take().as_ref(), long_padding);
                 for rest in &pieces[i + 1..] {
-                    out.extend_from_slice(rest);
+                    out.put_slice(rest);
                 }
                 break;
             }
             let command = if i == last && !self.padding { end_command(ts) } else { CMD_PADDING_CONTINUE };
-            out.extend_from_slice(&xtls_padding(b, command, self.uuid.take().as_ref(), long_padding));
+            xtls_padding_into(out, b, command, self.uuid.take().as_ref(), long_padding);
         }
-        out
     }
 }
 
@@ -471,7 +490,7 @@ impl<S: tokio::io::AsyncWrite + Unpin + super::record_gate::DirectSwitch> tokio:
             };
         }
 
-        me.write_pending.extend_from_slice(&me.padder.pad(buf, &mut me.traffic));
+        me.padder.pad_into(buf, &mut me.traffic, &mut me.write_pending);
         // 帧已接管全部输入，故对上层报告写入完成；余下由 poll_settle / poll_flush 负责送出。
         match me.poll_settle(cx) {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -546,15 +565,18 @@ impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::
             // 有没有 Direct 命令。见 record_gate 模块。
             me.inner.open_record_gate();
 
-            let mut chunk = [0u8; 16 * 1024];
-            let mut read_buf = tokio::io::ReadBuf::new(&mut chunk);
-            std::task::ready!(std::pin::Pin::new(&mut me.inner).poll_read(cx, &mut read_buf))?;
+            // 直接读进 read_raw 的尾部，不经中转缓冲。
+            let len = me.read_raw.len();
+            me.read_raw.resize(len + READ_CHUNK, 0);
+            let mut read_buf = tokio::io::ReadBuf::new(&mut me.read_raw[len..]);
+            let polled = std::pin::Pin::new(&mut me.inner).poll_read(cx, &mut read_buf);
             let filled = read_buf.filled().len();
+            me.read_raw.truncate(len + filled);
+            std::task::ready!(polled)?;
             if filled == 0 {
                 // EOF：残留的半帧只能丢弃（对端已关闭）。
                 return Poll::Ready(Ok(()));
             }
-            me.read_raw.extend_from_slice(read_buf.filled());
 
             // 先吃掉 VLESS 响应头，其后才是 Vision 帧。
             let header_done = me
@@ -567,15 +589,14 @@ impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::
 
             let was_done = me.unpadder.is_done();
             let was_direct = me.unpadder.is_direct();
-            let mut out = Vec::new();
+            // 走到这里 read_out 必为空（循环开头已交付），直接解进去。
             me.unpadder
-                .unpad(&mut me.read_raw, &mut out)
+                .unpad(&mut me.read_raw, &mut me.read_out)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            if !out.is_empty() {
+            if !me.read_out.is_empty() {
                 // 下行嗅探内层 ServerHello：决定上行结束 padding 时发 Direct 还是 End。
-                me.traffic.filter(&out);
+                me.traffic.filter(&me.read_out);
             }
-            me.read_out.extend_from_slice(&out);
 
             // 刚收到 End：此后不会再有 Direct，记录闸门停用，免得每条记录都多一次调度。
             if !was_done && me.unpadder.is_done() && !me.unpadder.is_direct() {

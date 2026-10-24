@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
+use tokio::time::Duration;
 use tracing::info;
 
 use crate::config::Config;
@@ -20,5 +21,9 @@ pub async fn handle_connection(mut client: TcpStream, cfg: Arc<Config>) -> Resul
     // 代价：出站失败时客户端只会看到连接被关闭，拿不到 SOCKS5 失败码。
     socks5::reply(&mut client, true).await?;
     let upstream = outbound::open(&cfg.outbound, &cfg.timeout, &target, &mut client).await?;
-    relay::relay(client, upstream).await
+    let timeouts = relay::Timeouts {
+        idle: Duration::from_millis(cfg.timeout.idle_ms),
+        half_close: Duration::from_millis(cfg.timeout.half_close_ms),
+    };
+    relay::relay(client, upstream, timeouts).await
 }

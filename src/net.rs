@@ -19,7 +19,11 @@ pub struct Target {
     pub port: u16,
 }
 
-/// 带超时的拨号，失败后按 `retries` 次线性退避重试；成功即开 TCP_NODELAY。
+/// 对齐 Go `net.Dialer` 默认：空闲 15s 后开始探测，每 15s 一次。
+/// NAT/中间设备静默丢弃连接时，内核能发现并让读写报错，而不是一直挂着。
+const KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// 带超时的拨号，失败后按 `retries` 次线性退避重试；成功即开 TCP_NODELAY 与 keepalive。
 pub async fn dial(server: &str, port: u16, connect_ms: u64, retries: u32) -> Result<TcpStream> {
     let mut last = RError::Protocol("no dial attempt".into());
 
@@ -27,6 +31,8 @@ pub async fn dial(server: &str, port: u16, connect_ms: u64, retries: u32) -> Res
         match timeout(Duration::from_millis(connect_ms), TcpStream::connect((server, port))).await {
             Ok(Ok(s)) => {
                 s.set_nodelay(true)?;
+                let keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE).with_interval(KEEPALIVE);
+                socket2::SockRef::from(&s).set_tcp_keepalive(&keepalive)?;
                 return Ok(s);
             },
             Ok(Err(e)) => last = RError::from(e),
@@ -74,7 +80,9 @@ mod tests {
         tokio::spawn(async move {
             let _ = l.accept().await;
         });
-        let s = dial("127.0.0.1", addr.port(), 1000, 1).await;
-        assert!(s.is_ok());
+        let s = dial("127.0.0.1", addr.port(), 1000, 1).await.unwrap();
+        assert!(s.nodelay().unwrap());
+        // NAT/中间设备静默丢连接时要能发现
+        assert!(socket2::SockRef::from(&s).keepalive().unwrap());
     }
 }

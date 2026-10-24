@@ -49,6 +49,8 @@ pub struct TimeoutCfg {
     pub connect_ms: u64,
     pub handshake_ms: u64,
     pub dial_retries: u32,
+    pub idle_ms: u64,
+    pub half_close_ms: u64,
 }
 
 // ---- 原始可反序列化结构（贴近 TOML） ----
@@ -106,12 +108,15 @@ struct RawTimeout {
     connect_ms: u64,
     handshake_ms: u64,
     dial_retries: u32,
+    idle_ms: u64,
+    half_close_ms: u64,
 }
 
 /// 默认偏向快速失败：拨号最坏 2×3s + 200ms 退避，握手对齐 xray 的 handshake 策略量级。
+/// 空闲 / 半关闭超时取 xray 默认策略：ConnectionIdle 300s，UplinkOnly/DownlinkOnly 1s。
 impl Default for RawTimeout {
     fn default() -> Self {
-        Self { connect_ms: 3000, handshake_ms: 5000, dial_retries: 1 }
+        Self { connect_ms: 3000, handshake_ms: 5000, dial_retries: 1, idle_ms: 300_000, half_close_ms: 1000 }
     }
 }
 
@@ -206,6 +211,8 @@ impl TryFrom<RawConfig> for Config {
                 connect_ms: r.timeout.connect_ms,
                 handshake_ms: r.timeout.handshake_ms,
                 dial_retries: r.timeout.dial_retries,
+                idle_ms: r.timeout.idle_ms,
+                half_close_ms: r.timeout.half_close_ms,
             },
         })
     }
@@ -376,6 +383,8 @@ dial_retries = 2
         assert_eq!(cfg.timeout.connect_ms, 3000);
         assert_eq!(cfg.timeout.handshake_ms, 5000);
         assert_eq!(cfg.timeout.dial_retries, 1);
+        assert_eq!(cfg.timeout.idle_ms, 300_000);
+        assert_eq!(cfg.timeout.half_close_ms, 1000);
     }
 
     #[test]

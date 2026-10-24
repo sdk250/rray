@@ -649,6 +649,7 @@ dependencies = [
  "rustls",
  "serde",
  "sha2",
+ "socket2",
  "thiserror",
  "time",
  "tokio",
