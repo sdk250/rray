@@ -121,11 +121,12 @@ struct RawTimeout {
     half_close_ms: u64,
 }
 
-/// 默认偏向快速失败：拨号最坏 2×3s + 200ms 退避，握手对齐 xray 的 handshake 策略量级。
+/// 拨号偏向快速失败：最坏 2×3s + 200ms 退避。握手给到 10s：服务端握手时要去连伪装站，
+/// 突发并发下那边的 SYN 被丢要靠重传（1s、3s、7s…），太短会把本能成功的连接判死。
 /// 空闲 / 半关闭超时取 xray 默认策略：ConnectionIdle 300s，UplinkOnly/DownlinkOnly 1s。
 impl Default for RawTimeout {
     fn default() -> Self {
-        Self { connect_ms: 3000, handshake_ms: 5000, dial_retries: 1, idle_ms: 300_000, half_close_ms: 1000 }
+        Self { connect_ms: 3000, handshake_ms: 10_000, dial_retries: 1, idle_ms: 300_000, half_close_ms: 1000 }
     }
 }
 
@@ -398,7 +399,7 @@ dial_retries = 2
         let text = SAMPLE.split("[timeout]").next().unwrap();
         let cfg: Config = toml::from_str::<RawConfig>(text).unwrap().try_into().unwrap();
         assert_eq!(cfg.timeout.connect_ms, 3000);
-        assert_eq!(cfg.timeout.handshake_ms, 5000);
+        assert_eq!(cfg.timeout.handshake_ms, 10_000);
         assert_eq!(cfg.timeout.dial_retries, 1);
         assert_eq!(cfg.timeout.idle_ms, 300_000);
         assert_eq!(cfg.timeout.half_close_ms, 1000);
@@ -409,7 +410,7 @@ dial_retries = 2
         let text = format!("{}[timeout]\nconnect_ms = 1500\n", SAMPLE.split("[timeout]").next().unwrap());
         let cfg: Config = toml::from_str::<RawConfig>(&text).unwrap().try_into().unwrap();
         assert_eq!(cfg.timeout.connect_ms, 1500);
-        assert_eq!(cfg.timeout.handshake_ms, 5000);
+        assert_eq!(cfg.timeout.handshake_ms, 10_000);
         assert_eq!(cfg.timeout.dial_retries, 1);
     }
 
