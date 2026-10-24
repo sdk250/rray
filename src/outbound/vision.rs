@@ -104,6 +104,10 @@ impl Unpadder {
         Self { expect_uuid: true, done: false, direct: false }
     }
 
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
+
     pub(crate) fn is_direct(&self) -> bool {
         self.direct
     }
@@ -496,6 +500,14 @@ impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::
                 return std::pin::Pin::new(&mut me.inner).poll_read_direct(cx, buf);
             }
 
+            // End 之后不再有帧：经 TLS 直接读进调用方的缓冲，省掉中转拷贝。
+            if me.unpadder.is_done() && me.read_raw.is_empty() {
+                let before = buf.filled().len();
+                std::task::ready!(std::pin::Pin::new(&mut me.inner).poll_read(cx, buf))?;
+                me.traffic.filter(&buf.filled()[before..]);
+                return Poll::Ready(Ok(()));
+            }
+
             // 还在 padding 阶段：放行下一条 TLS 记录，好让我们逐条检查明文里
             // 有没有 Direct 命令。见 record_gate 模块。
             me.inner.open_record_gate();
@@ -519,6 +531,7 @@ impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::
                 continue;
             }
 
+            let was_done = me.unpadder.is_done();
             let was_direct = me.unpadder.is_direct();
             let mut out = Vec::new();
             me.unpadder
@@ -529,6 +542,11 @@ impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::
                 me.traffic.filter(&out);
             }
             me.read_out.extend_from_slice(&out);
+
+            // 刚收到 End：此后不会再有 Direct，记录闸门停用，免得每条记录都多一次调度。
+            if !was_done && me.unpadder.is_done() && !me.unpadder.is_direct() {
+                me.inner.stop_record_gate();
+            }
 
             // 刚刚切到直通：把 TLS 层下面已缓冲、尚未解析的裸字节接上，
             // 它们就是直通流的开头（等价于 Go 版合并 rawInput 的那一步）。
@@ -916,6 +934,7 @@ mod tests {
     struct SplitInner {
         tls: tokio::io::DuplexStream,
         raw: tokio::io::DuplexStream,
+        gate_stopped: bool,
     }
 
     impl tokio::io::AsyncRead for SplitInner {
@@ -953,6 +972,10 @@ mod tests {
     }
 
     impl super::super::record_gate::DirectSwitch for SplitInner {
+        fn stop_record_gate(&mut self) {
+            self.gate_stopped = true;
+        }
+
         fn poll_read_direct(
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -1000,7 +1023,7 @@ mod tests {
     async fn end_keeps_reading_through_tls() {
         let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
         let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+        let mut vs = VisionStream::new(SplitInner { tls, raw, gate_stopped: false }, UUID);
 
         tls_peer.write_all(&xtls_padding(b"hello", CMD_PADDING_END, Some(&UUID), false)).await.unwrap();
         assert_eq!(read_n(&mut vs, 5).await, b"hello");
@@ -1012,12 +1035,28 @@ mod tests {
         assert_eq!(read_n(&mut vs, 18).await, b" after end via tls");
     }
 
+    /// 收到 End 后不会再有 Direct，记录闸门没用了，应当停用（省掉逐条记录的调度）。
+    #[tokio::test]
+    async fn end_stops_record_gating() {
+        let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
+        let (_raw_peer, raw) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::new(SplitInner { tls, raw, gate_stopped: false }, UUID);
+
+        tls_peer.write_all(&xtls_padding(b"pad", CMD_PADDING_CONTINUE, Some(&UUID), false)).await.unwrap();
+        assert_eq!(read_n(&mut vs, 3).await, b"pad");
+        assert!(!vs.inner.gate_stopped, "padding 阶段闸门必须开着");
+
+        tls_peer.write_all(&xtls_padding(b"end", CMD_PADDING_END, None, false)).await.unwrap();
+        assert_eq!(read_n(&mut vs, 3).await, b"end");
+        assert!(vs.inner.gate_stopped);
+    }
+
     /// `Direct` 才切到越过 TLS 直接读裸 socket。
     #[tokio::test]
     async fn direct_switches_to_raw_socket() {
         let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
         let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+        let mut vs = VisionStream::new(SplitInner { tls, raw, gate_stopped: false }, UUID);
 
         tls_peer.write_all(&xtls_padding(b"hello", CMD_PADDING_DIRECT, Some(&UUID), false)).await.unwrap();
         raw_peer.write_all(b" raw tail").await.unwrap();
@@ -1033,7 +1072,7 @@ mod tests {
     async fn uplink_direct_switches_writes_to_raw_socket() {
         let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
         let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+        let mut vs = VisionStream::new(SplitInner { tls, raw, gate_stopped: false }, UUID);
 
         vs.write_all(&client_hello()).await.unwrap();
         let sh = server_hello(0x1301, true);
@@ -1064,7 +1103,7 @@ mod tests {
     async fn shutdown_after_uplink_direct_skips_tls() {
         let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
         let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+        let mut vs = VisionStream::new(SplitInner { tls, raw, gate_stopped: false }, UUID);
 
         vs.write_all(&client_hello()).await.unwrap();
         vs.traffic.filter(&server_hello(0x1301, true));
@@ -1088,7 +1127,7 @@ mod tests {
     async fn shutdown_without_uplink_direct_uses_tls() {
         let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
         let (_raw_peer, raw) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+        let mut vs = VisionStream::new(SplitInner { tls, raw, gate_stopped: false }, UUID);
 
         vs.write_all(b"plain").await.unwrap();
         vs.shutdown().await.unwrap();

@@ -58,6 +58,13 @@ impl<S> RecordGate<S> {
         self.gate_open = true;
     }
 
+    /// 停用闸门，回到透明转发。Vision 收到 End 后不会再有 Direct，逐条放行已无必要；
+    /// 停在一条记录中间也安全 —— 透明模式下 rustls 自己按字节流定界。
+    pub fn stop_gating(&mut self) {
+        self.gating = false;
+        self.record_remaining = 0;
+    }
+
     /// 允许再交付一条记录。
     pub fn open(&mut self) {
         self.gate_open = true;
@@ -172,6 +179,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RecordGate<S> {
 pub trait DirectSwitch {
     /// 允许 TLS 层再消费一条记录。
     fn open_record_gate(&mut self) {}
+    /// 不再需要逐条放行（收到 End 之后）。
+    fn stop_record_gate(&mut self) {}
 
     /// 取走 TLS 层下面已缓冲、尚未解析的裸字节。
     fn take_buffered_raw(&mut self) -> BytesMut {
@@ -203,6 +212,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DirectSwitch
 {
     fn open_record_gate(&mut self) {
         self.get_mut().0.open();
+    }
+
+    fn stop_record_gate(&mut self) {
+        self.get_mut().0.stop_gating();
     }
 
     fn take_buffered_raw(&mut self) -> BytesMut {
@@ -326,6 +339,57 @@ mod tests {
 
         // 关键：记录之后的裸字节还完整留在我们手里，没被喂给 TLS 层
         assert_eq!(&gate.take_buffered()[..], raw_tail);
+    }
+
+    /// 停用闸门后（Vision 收到 End，不会再有 Direct）：不再逐条放行，剩下的全部透传。
+    #[tokio::test]
+    async fn stop_gating_passes_everything_through() {
+        let (mut peer, sock) = tokio::io::duplex(16 * 1024);
+        let mut gate = RecordGate::new(sock);
+        gate.start_gating();
+
+        let r1 = record(0x17, b"first record");
+        let r2 = record(0x17, b"second record");
+        let mut wire = r1.clone();
+        wire.extend_from_slice(&r2);
+        wire.extend_from_slice(b"tail");
+        peer.write_all(&wire).await.unwrap();
+
+        let mut got = vec![0u8; r1.len()];
+        gate.read_exact(&mut got).await.unwrap();
+        gate.stop_gating();
+
+        let mut rest = vec![0u8; r2.len() + 4];
+        tokio::time::timeout(std::time::Duration::from_millis(200), gate.read_exact(&mut rest))
+            .await
+            .expect("停用闸门后还在等开闸")
+            .unwrap();
+        assert_eq!(&rest[..r2.len()], &r2[..]);
+        assert_eq!(&rest[r2.len()..], b"tail");
+    }
+
+    /// 停用发生在一条记录交付到一半时，也不能丢字节或错位。
+    #[tokio::test]
+    async fn stop_gating_mid_record_keeps_bytes() {
+        let (mut peer, sock) = tokio::io::duplex(16 * 1024);
+        let mut gate = RecordGate::new(sock);
+        gate.start_gating();
+
+        let r1 = record(0x17, b"0123456789");
+        let mut wire = r1.clone();
+        wire.extend_from_slice(b"after");
+        peer.write_all(&wire).await.unwrap();
+
+        let mut head = vec![0u8; 7];
+        gate.read_exact(&mut head).await.unwrap();
+        gate.stop_gating();
+
+        let mut rest = vec![0u8; r1.len() - 7 + 5];
+        gate.read_exact(&mut rest).await.unwrap();
+        let mut all = head;
+        all.extend_from_slice(&rest);
+        assert_eq!(&all[..r1.len()], &r1[..]);
+        assert_eq!(&all[r1.len()..], b"after");
     }
 
     /// 记录被拆成小块到达时也要正确定界。
