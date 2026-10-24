@@ -30,6 +30,9 @@ pub enum RError {
 
     #[error("protocol error: {0}")]
     Protocol(Cow<'static, str>),
+
+    #[error("[{0}] An error occurred: {1}")]
+    Custom(&'static str, Cow<'static, str>)
 }
 
 impl RError {
