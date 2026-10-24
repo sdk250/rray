@@ -59,6 +59,7 @@ struct RawConfig {
     log: RawLog,
     inbound: RawInbound,
     outbound: RawOutbound,
+    #[serde(default)]
     timeout: RawTimeout,
 }
 
@@ -100,11 +101,18 @@ struct RawReality {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawTimeout {
     connect_ms: u64,
     handshake_ms: u64,
     dial_retries: u32,
+}
+
+/// 默认偏向快速失败：拨号最坏 2×3s + 200ms 退避，握手对齐 xray 的 handshake 策略量级。
+impl Default for RawTimeout {
+    fn default() -> Self {
+        Self { connect_ms: 3000, handshake_ms: 5000, dial_retries: 1 }
+    }
 }
 
 /// 解析 `8-4-4-4-12` 形式的 UUID 为 16 字节（连字符位置不作要求）。
@@ -358,6 +366,25 @@ dial_retries = 2
         );
         let err = toml::from_str::<RawConfig>(&text).err().expect("unknown field accepted");
         assert!(err.message().contains("fingerprint"), "{}", err.message());
+    }
+
+    /// 省略 [timeout] 时用默认值：快速失败，最坏约 2×3s + 200ms 退避。
+    #[test]
+    fn timeout_section_is_optional() {
+        let text = SAMPLE.split("[timeout]").next().unwrap();
+        let cfg: Config = toml::from_str::<RawConfig>(text).unwrap().try_into().unwrap();
+        assert_eq!(cfg.timeout.connect_ms, 3000);
+        assert_eq!(cfg.timeout.handshake_ms, 5000);
+        assert_eq!(cfg.timeout.dial_retries, 1);
+    }
+
+    #[test]
+    fn timeout_fields_default_individually() {
+        let text = format!("{}[timeout]\nconnect_ms = 1500\n", SAMPLE.split("[timeout]").next().unwrap());
+        let cfg: Config = toml::from_str::<RawConfig>(&text).unwrap().try_into().unwrap();
+        assert_eq!(cfg.timeout.connect_ms, 1500);
+        assert_eq!(cfg.timeout.handshake_ms, 5000);
+        assert_eq!(cfg.timeout.dial_retries, 1);
     }
 
     #[test]

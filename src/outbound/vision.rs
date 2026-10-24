@@ -28,6 +28,8 @@ const TLS_RECORD_HEADER_LEN: usize = 5;
 
 /// xray 的 `buf.Size`，padding 上限按它算。
 const BUF_SIZE: usize = 8192;
+/// 单帧内容上限：xray `ReshapeMultiBuffer` 会把 ≥ `buf.Size - 21` 的 buffer 拆开。
+pub(crate) const MAX_FRAME_CONTENT: usize = BUF_SIZE - UUID_LEN - HEADER_LEN;
 /// testseed 默认值 `{900, 500, 900, 256}`（`proxy.go:307`）。
 const SEED_LONG_THRESHOLD: usize = 900;
 const SEED_LONG_RANGE: u32 = 500;
@@ -153,6 +155,13 @@ impl Padder {
         !self.padding
     }
 
+    /// 伪装帧：空内容 + 长 padding，用来和 VLESS 头拼在同一次写入里遮住头的长度特征。
+    /// 对应 xray 的 `XtlsPadding(nil, CommandPaddingContinue, &writeOnceUserUUID, true, ...)`。
+    /// 它不是被代理的数据，不占 TLS 嗅探的名额。
+    fn camouflage(&mut self) -> Vec<u8> {
+        xtls_padding(&[], CMD_PADDING_CONTINUE, self.uuid.take().as_ref(), true)
+    }
+
     /// 嗅探被代理流量是否是 TLS（xray `XtlsFilterTls` 的客户端所需部分）。
     fn filter_tls(&mut self, data: &[u8]) {
         if self.filter_budget == 0 {
@@ -249,24 +258,35 @@ impl<S> VisionStream<S> {
         }
     }
 
-    /// 客户端出站路径的构造器：首帧（携带 UUID 的伪装帧）已经由 `outbound::open`
-    /// 连同 VLESS 头一起发出，故不再写 UUID 前缀；而 VLESS **响应**头还没读，
-    /// 要在读路径上惰性剥离。见 docs/reference/vision-format.md。
-    pub fn with_first_frame_sent(inner: S) -> Self {
-        let mut s = Self::new(inner, [0u8; 16]);
-        s.padder.uuid = None;
+    /// 客户端出站路径的构造器。首帧要由 [`Self::write_first`] 连同 VLESS 头一起发出；
+    /// VLESS **响应**头还没读，要在读路径上惰性剥离。见 docs/reference/vision-format.md。
+    pub fn client(inner: S, uuid: [u8; 16]) -> Self {
+        let mut s = Self::new(inner, uuid);
         s.response_header = super::vless::ResponseHeader::new();
         s
     }
 }
 
-/// 伪装帧：空内容 + 长 padding，用来和 VLESS 头拼在同一次写入里遮住头的长度特征。
-/// 对应 xray 的 `XtlsPadding(nil, CommandPaddingContinue, &writeOnceUserUUID, true, ...)`。
-pub fn camouflage_frame(uuid: &[u8; 16]) -> Vec<u8> {
-    xtls_padding(&[], CMD_PADDING_CONTINUE, Some(uuid), true)
-}
-
 impl<S: tokio::io::AsyncWrite + Unpin> VisionStream<S> {
+    /// 首次写入：VLESS 头（裸，不进 Vision 帧）‖ 第一个 Vision 帧，**一次写出**，
+    /// 二者落在同一条 TLS 记录里，头的长度特征被 padding 遮住。
+    /// 有首包就让它走正常的 padding（也参与 TLS 嗅探）；没有就发伪装帧。
+    /// 对照 xray `vless/outbound/outbound.go` 的 BufferedWriter + `ReadMultiBufferTimeout`。
+    pub async fn write_first(&mut self, header: &[u8], payload: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let frame = if payload.is_empty() {
+            self.padder.camouflage()
+        } else {
+            self.padder.pad(payload)
+        };
+        let mut first = Vec::with_capacity(header.len() + frame.len());
+        first.extend_from_slice(header);
+        first.extend_from_slice(&frame);
+        self.inner.write_all(&first).await?;
+        self.inner.flush().await
+    }
+
     /// 把 `write_pending` 尽量写进 inner；写空返回 Ready。
     fn poll_drain(
         &mut self,
@@ -600,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn stream_strips_vless_response_header_lazily() {
         let (mut peer, sock) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::with_first_frame_sent(sock);
+        let mut vs = VisionStream::client(sock, UUID);
 
         // 客户端必须能在收到任何下行字节之前就把上行载荷发出去，
         // 否则就是那个环等死锁。
@@ -625,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn stream_skips_response_header_with_addons() {
         let (mut peer, sock) = tokio::io::duplex(64 * 1024);
-        let mut vs = VisionStream::with_first_frame_sent(sock);
+        let mut vs = VisionStream::client(sock, UUID);
 
         let mut wire = vec![0x00, 0x03, 0xAA, 0xBB, 0xCC];
         wire.extend_from_slice(&xtls_padding(b"payload", CMD_PADDING_END, Some(&UUID), false));
@@ -635,6 +655,59 @@ mod tests {
         let mut got = vec![0u8; 7];
         vs.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"payload");
+    }
+
+    /// 首次写入 = VLESS 头（裸）‖ 携带首包的第一个 Vision 帧（带 UUID 前缀），一次写出。
+    #[tokio::test]
+    async fn first_write_merges_header_and_payload() {
+        let (mut peer, sock) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::client(sock, UUID);
+        vs.write_first(b"HDR", b"client hello").await.unwrap();
+        vs.write_all(b" and more").await.unwrap();
+        vs.flush().await.unwrap();
+
+        let mut raw = vec![0u8; 8192];
+        let n = peer.read(&mut raw).await.unwrap();
+        assert_eq!(&raw[..3], b"HDR");
+        let (_, out) = unpad_all(&raw[3..n]);
+        assert_eq!(out, b"client hello and more");
+    }
+
+    /// 没有首包（服务端先说话的协议）：头后面跟空内容的伪装帧，之后的帧不再带 UUID。
+    #[tokio::test]
+    async fn first_write_without_payload_sends_camouflage() {
+        let (mut peer, sock) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::client(sock, UUID);
+        vs.write_first(b"HDR", b"").await.unwrap();
+
+        let mut raw = vec![0u8; 8192];
+        let n = peer.read(&mut raw).await.unwrap();
+        assert_eq!(&raw[..3], b"HDR");
+        assert_eq!(&raw[3..3 + UUID_LEN], &UUID);
+        assert_eq!(raw[3 + UUID_LEN], CMD_PADDING_CONTINUE);
+        let (_, out) = unpad_all(&raw[3..n]);
+        assert!(out.is_empty());
+
+        vs.write_all(b"later").await.unwrap();
+        vs.flush().await.unwrap();
+        let n2 = peer.read(&mut raw[n..]).await.unwrap();
+        let (_, out) = unpad_all(&raw[3..n + n2]);
+        assert_eq!(out, b"later");
+    }
+
+    /// 首包多半是内层 ClientHello，必须经过 Padder 的 TLS 嗅探，否则永远切不了直通。
+    #[tokio::test]
+    async fn first_payload_feeds_tls_sniffing() {
+        let (_peer, sock) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::client(sock, UUID);
+        let mut client_hello = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01];
+        client_hello.extend_from_slice(&[0u8; 4]);
+        vs.write_first(b"HDR", &client_hello).await.unwrap();
+
+        let mut app_data = vec![0x17, 0x03, 0x03, 0x00, 0x08];
+        app_data.extend_from_slice(&[0x42u8; 8]);
+        vs.write_all(&app_data).await.unwrap();
+        assert!(vs.padder.is_direct());
     }
 
     /// padding 长度必须落在 xray 的公式范围内，且不越 buf.Size 上限。
