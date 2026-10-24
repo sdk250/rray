@@ -32,9 +32,28 @@ pub enum RError {
     Protocol(Cow<'static, str>),
 }
 
+impl RError {
+    /// 对端主动断开了连接（RST / 管道已断）。浏览器取消请求、关掉页面都会这样，属于常态。
+    pub fn is_peer_gone(&self) -> bool {
+        use std::io::ErrorKind::*;
+        matches!(self, RError::IO(e) if matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 对端主动断开（浏览器取消请求等）是常态，不该当成故障。
+    #[test]
+    fn peer_gone_is_recognised() {
+        use std::io::ErrorKind::*;
+        for kind in [ConnectionReset, ConnectionAborted, BrokenPipe] {
+            assert!(RError::from(IoError::from(kind)).is_peer_gone(), "{kind:?}");
+        }
+        assert!(!RError::from(IoError::from(TimedOut)).is_peer_gone());
+        assert!(!RError::Reality("handshake timeout".into()).is_peer_gone());
+    }
 
     #[test]
     fn variants_display() {

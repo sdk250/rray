@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::net::{ TcpListener, TcpStream };
 use tokio::sync::Semaphore;
 use tokio::time::{ Duration, sleep };
-use tracing::{ error, info, warn };
+use tracing::{ debug, error, info, warn };
 
 use crate::config::Config;
 use crate::error::Result;
@@ -36,8 +36,11 @@ pub async fn serve(listener: TcpListener, cfg: Arc<Config>) {
                 let cfg = cfg.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_connection(stream, cfg).await {
-                        warn!("connection from {} failed: {}", peer_addr, e);
+                    match handle_connection(stream, cfg).await {
+                        Ok(()) => {},
+                        // 对端断开是常态（浏览器取消请求等），只在 debug 下留痕，免得淹没真正的故障。
+                        Err(e) if e.is_peer_gone() => debug!("connection from {} closed by peer: {}", peer_addr, e),
+                        Err(e) => warn!("connection from {} failed: {}", peer_addr, e),
                     }
                 });
             },
