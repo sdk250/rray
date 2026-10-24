@@ -1,0 +1,45 @@
+# rray 示例配置。复制为 config.toml（已在 .gitignore 中）后填入自己的服务器与凭据。
+# 程序从当前工作目录读取 config.toml；出现未知字段会直接报错，不会静默忽略。
+
+[log]
+# trace / debug / info / warn / error
+level = "info"
+
+[inbound]
+# SOCKS5 入站（no-auth，仅 CONNECT）
+listen = "127.0.0.1"
+port = 1080
+# 同时处理的连接上限，0 表示不限。满额时暂停 accept，新连接在内核 backlog 里排队。
+# 可省略，默认 1024。
+max_connections = 1024
+
+[outbound]
+# VLESS + REALITY + Vision 服务器。填域名时解析结果缓存 60s，多地址按 Happy Eyeballs 并发拨号。
+server = "example.com"
+port = 443
+
+[outbound.vless]
+uuid = "00000000-0000-0000-0000-000000000000"
+# 目前只支持 xtls-rprx-vision
+flow = "xtls-rprx-vision"
+
+[outbound.reality]
+# 服务端 privateKey 对应的公钥（xray x25519 输出的 Password / PublicKey），base64url 或标准 base64 均可
+public_key = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
+# 服务端 shortIds 之一，十六进制，最长 8 字节
+short_id = "0123abcd"
+# 必须在服务端 serverNames 里
+server_name = "www.example.com"
+
+# 整段可省略；单个字段也可省略，取下面的默认值。
+[timeout]
+# 单次拨号（含域名解析）超时
+connect_ms = 3000
+# REALITY 握手超时。服务端握手时要去连伪装站，突发并发下可能靠 SYN 重传，别设得太短。
+handshake_ms = 10000
+# 拨号失败后的重试次数（线性退避 200ms、400ms…）
+dial_retries = 1
+# 两个方向都没有数据超过这么久就断开（xray ConnectionIdle）
+idle_ms = 300000
+# 一个方向已结束后，另一方向空闲这么久就断开（xray UplinkOnly / DownlinkOnly）
+half_close_ms = 1000

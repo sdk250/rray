@@ -424,6 +424,19 @@ dial_retries = 2
         assert_eq!(parse(&text).unwrap().inbound.max_connections, 0);
     }
 
+    /// 仓库里的示例配置必须能解析，且其中写明的默认值与代码一致（改默认值时会提醒同步示例）。
+    #[test]
+    fn example_config_parses_and_documents_defaults() {
+        let cfg = parse(include_str!("../config.example.toml")).unwrap();
+        let defaults = RawTimeout::default();
+        assert_eq!(cfg.inbound.max_connections, default_max_connections());
+        assert_eq!(cfg.timeout.connect_ms, defaults.connect_ms);
+        assert_eq!(cfg.timeout.handshake_ms, defaults.handshake_ms);
+        assert_eq!(cfg.timeout.dial_retries, defaults.dial_retries);
+        assert_eq!(cfg.timeout.idle_ms, defaults.idle_ms);
+        assert_eq!(cfg.timeout.half_close_ms, defaults.half_close_ms);
+    }
+
     #[test]
     fn loads_full_config() {
         let cfg: Config = toml::from_str::<RawConfig>(SAMPLE).unwrap().try_into().unwrap();
