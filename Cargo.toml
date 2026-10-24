@@ -21,3 +21,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.23", features = ["time"] }
 x25519-dalek = "2.0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

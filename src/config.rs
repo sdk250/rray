@@ -117,7 +117,7 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
 
 pub fn parse_hex(s: &str) -> Result<Vec<u8>> {
     let s = s.as_bytes();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(RError::Config("hex length must be even".into()));
     }
     fn nibble(c: u8) -> Result<u8> {

@@ -1,13 +1,3 @@
-mod config;
-mod error;
-mod ext;
-mod net;
-mod inbound;
-mod outbound;
-mod relay;
-mod driver;
-
-
 use std::sync::Arc;
 
 use tracing::{ error, info, warn };
@@ -16,25 +6,14 @@ use tokio::{
     time::{ sleep, Duration }
 };
 
-use config::Config;
-use error::{ Result, RError };
-use ext::logger_service;
-use driver::handle_connection;
+use rray::config::{ self, Config };
+use rray::error::Result;
+use rray::ext::{ logger_service, parse_level };
+use rray::driver::handle_connection;
 
 
 const CONFIG_PATH: &str = "config.toml";
 
-
-fn parse_level(s: &str) -> Result<tracing::Level> {
-    match s.to_ascii_lowercase().as_str() {
-        "trace" => Ok(tracing::Level::TRACE),
-        "debug" => Ok(tracing::Level::DEBUG),
-        "info" => Ok(tracing::Level::INFO),
-        "warn" | "warning" => Ok(tracing::Level::WARN),
-        "error" => Ok(tracing::Level::ERROR),
-        other => Err(RError::Config(format!("unknown log level: {other}").into())),
-    }
-}
 
 async fn serve(cfg: Arc<Config>) -> Result<()> {
     let listener = TcpListener::bind((cfg.inbound.listen, cfg.inbound.port)).await?;

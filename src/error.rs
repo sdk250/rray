@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     io::Error as IoError,
-    sync::Arc
 };
 use tokio::time::error::Elapsed as TimeoutError;
 use thiserror::Error;
@@ -15,9 +14,6 @@ pub enum RError {
 
     #[error("Timeout error: {0}")]
     Timeout(#[from] TimeoutError),
-
-    #[error("An error occurred in {0}: {1}")]
-    Generic(&'static str, Arc<str>),
 
     // 统一用 Cow：固定字面量零分配，需要拼外部信息时再 `String` -> `Cow::Owned`。
     #[error("config error: {0}")]

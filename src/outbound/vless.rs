@@ -76,10 +76,6 @@ impl ResponseHeader {
         Self { done: true }
     }
 
-    pub fn is_done(&self) -> bool {
-        self.done
-    }
-
     /// 尝试从 `buf` 头部吃掉响应头。字节不够就原样留着，返回 `Ok(false)`。
     pub fn feed(&mut self, buf: &mut bytes::BytesMut) -> Result<bool> {
         use bytes::Buf;

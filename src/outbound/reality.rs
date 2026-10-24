@@ -134,10 +134,11 @@ impl SecureRandom for ScriptedRandom {
                 Some(script) => {
                     script.stream.fill(buf);
                     let idx = script.calls.len();
-                    if let Some((n, bytes)) = &script.replace {
-                        if *n == idx && bytes.len() == buf.len() {
-                            buf.copy_from_slice(bytes);
-                        }
+                    if let Some((n, bytes)) = &script.replace
+                        && *n == idx
+                        && bytes.len() == buf.len()
+                    {
+                        buf.copy_from_slice(bytes);
                     }
                     script.calls.push(buf.to_vec());
                     Ok(())

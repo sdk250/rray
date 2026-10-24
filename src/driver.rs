@@ -9,7 +9,7 @@ use crate::{ inbound::socks5, outbound, relay };
 
 /// 编排单条连接：SOCKS5 握手 → 开出站 → 回复客户端 → 双向转发。
 /// 每条连接独立 spawn，错误不传染其它连接。
-pub(crate) async fn handle_connection(mut client: TcpStream, cfg: Arc<Config>) -> Result<()> {
+pub async fn handle_connection(mut client: TcpStream, cfg: Arc<Config>) -> Result<()> {
     client.set_nodelay(true)?;
 
     let target = socks5::handshake(&mut client).await?;

@@ -1,5 +1,20 @@
 use tracing_subscriber::fmt as tracing_fmt;
 use time::macros::{ format_description as time_description, offset as time_offset };
+use tracing::Level;
+
+use crate::error::{ RError, Result };
+
+
+pub fn parse_level(s: &str) -> Result<Level> {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => Ok(Level::TRACE),
+        "debug" => Ok(Level::DEBUG),
+        "info" => Ok(Level::INFO),
+        "warn" | "warning" => Ok(Level::WARN),
+        "error" => Ok(Level::ERROR),
+        other => Err(RError::Config(format!("unknown log level: {other}").into())),
+    }
+}
 
 pub fn logger_service(
     level: tracing::Level,
