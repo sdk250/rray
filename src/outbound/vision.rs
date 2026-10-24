@@ -5,7 +5,9 @@
 //! 作用：被代理流量本身多半是 TLS（HTTPS），直接套在外层 TLS 里会形成
 //! "TLS-in-TLS" 的长度特征。Vision 在内层 TLS 握手期间给每个包套一层
 //! `command | contentLen | paddingLen | content | padding` 打散长度，
-//! 一旦内层握手结束（出现 application_data 记录）就发 `End` 命令切到直通。
+//! 内层握手结束（出现 application_data 记录）时结束 padding：内层是 TLS 1.3 发
+//! `Direct`，此后该方向越过外层 TLS 直写裸 TCP；否则发 `End`，此后不加 padding
+//! 但仍走外层 TLS。非 TLS 流量在嗅探名额快用完时提前 `End`。
 
 use bytes::{ Buf, BytesMut };
 
@@ -24,6 +26,16 @@ const UUID_LEN: usize = 16;
 const TLS_APPLICATION_DATA_START: [u8; 3] = [0x17, 0x03, 0x03];
 /// 内层 TLS 握手记录起始字节，用于判定"被代理流量是 TLS"。
 const TLS_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
+/// ServerHello 所在握手记录的起始字节。
+const TLS_SERVER_HANDSHAKE_START: [u8; 3] = [0x16, 0x03, 0x03];
+const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const TLS_HANDSHAKE_SERVER_HELLO: u8 = 0x02;
+/// ServerHello 里的 supported_versions 扩展 = TLS 1.3。
+const TLS13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+/// 允许 XTLS 直通的 TLS 1.3 套件：xray `Tls13CipherSuiteDic` 去掉 CCM_8（0x1305）。
+const XTLS_CIPHERS: std::ops::RangeInclusive<u16> = 0x1301..=0x1304;
+/// xray 的 `NumberOfPacketToFilter`：两个方向合计只嗅探前这么多个包。
+const FILTER_PACKETS: i32 = 8;
 const TLS_RECORD_HEADER_LEN: usize = 5;
 
 /// xray 的 `buf.Size`，padding 上限按它算。
@@ -140,26 +152,97 @@ impl Unpadder {
     }
 }
 
-/// 写方向状态机。对应 xray `VisionWriter` 的 `isPadding` 与 TLS 嗅探。
+/// 被代理流量的嗅探结果，读写两个方向共用。对应 xray `TrafficState` 中
+/// 由 `XtlsFilterTls` 维护的那部分：写方向看到内层 ClientHello，读方向看到
+/// 内层 ServerHello，后者决定能不能开 XTLS 直通。
+#[derive(Debug)]
+pub(crate) struct TrafficState {
+    /// 还剩几个包要嗅探。判定出结果后清零。
+    filter_budget: i32,
+    is_tls: bool,
+    /// 见到了 ServerHello（TLS 1.2 及以上）。
+    is_tls12_or_above: bool,
+    /// 内层是 TLS 1.3 且套件允许：padding 结束时发 Direct 而不是 End。
+    enable_xtls: bool,
+    cipher: u16,
+    /// ServerHello 还剩多少字节没看完（可能跨多个包）。
+    remaining_server_hello: i32,
+}
+
+impl TrafficState {
+    pub(crate) fn new() -> Self {
+        Self {
+            filter_budget: FILTER_PACKETS,
+            is_tls: false,
+            is_tls12_or_above: false,
+            enable_xtls: false,
+            cipher: 0,
+            remaining_server_hello: -1,
+        }
+    }
+
+    /// 嗅探一个包。逐行对照 xray `proxy.go` 的 `XtlsFilterTls`。
+    pub(crate) fn filter(&mut self, b: &[u8]) {
+        if self.filter_budget <= 0 {
+            return;
+        }
+        self.filter_budget -= 1;
+
+        if b.len() >= 6 {
+            if b[..3] == TLS_SERVER_HANDSHAKE_START && b[5] == TLS_HANDSHAKE_SERVER_HELLO {
+                self.remaining_server_hello =
+                    (i32::from(b[3]) << 8 | i32::from(b[4])) + TLS_RECORD_HEADER_LEN as i32;
+                self.is_tls12_or_above = true;
+                self.is_tls = true;
+                // record(5) + type(1) + len(3) + version(2) + random(32) = 43：session_id 长度
+                if b.len() >= 79 && self.remaining_server_hello >= 79 {
+                    let sid = b[43] as usize;
+                    if let Some(c) = b.get(44 + sid..46 + sid) {
+                        self.cipher = u16::from_be_bytes([c[0], c[1]]);
+                    }
+                }
+            } else if b[..2] == TLS_HANDSHAKE_START && b[5] == TLS_HANDSHAKE_CLIENT_HELLO {
+                self.is_tls = true;
+            }
+        }
+
+        if self.remaining_server_hello > 0 {
+            let end = (self.remaining_server_hello as usize).min(b.len());
+            self.remaining_server_hello -= b.len() as i32;
+            if b[..end].windows(TLS13_SUPPORTED_VERSIONS.len()).any(|w| w == TLS13_SUPPORTED_VERSIONS) {
+                self.enable_xtls = XTLS_CIPHERS.contains(&self.cipher);
+                tracing::debug!(cipher = self.cipher, xtls = self.enable_xtls, "vision sniffed inner tls 1.3");
+                self.filter_budget = 0;
+            } else if self.remaining_server_hello <= 0 {
+                tracing::debug!("vision sniffed inner tls 1.2");
+                self.filter_budget = 0;
+            }
+        }
+    }
+}
+
+/// 写方向状态机。对应 xray `VisionWriter` 的 `isPadding` / `UplinkWriterDirectCopy`。
 #[derive(Debug)]
 pub(crate) struct Padder {
     /// 还在加 padding 阶段。
     padding: bool,
+    /// padding 以 Direct 结束：此后的上行要越过外层 TLS 写裸 socket。
+    direct: bool,
     /// 第一帧要带的 UUID，写一次后置 None。
     uuid: Option<[u8; 16]>,
-    /// 已嗅探到被代理流量是 TLS。
-    is_tls: bool,
-    /// 还剩几个包要嗅探（xray 的 NumberOfPacketToFilter = 8）。
-    filter_budget: u32,
 }
 
 impl Padder {
     pub(crate) fn new(uuid: [u8; 16]) -> Self {
-        Self { padding: true, uuid: Some(uuid), is_tls: false, filter_budget: 8 }
+        Self { padding: true, direct: false, uuid: Some(uuid) }
     }
 
-    pub(crate) fn is_direct(&self) -> bool {
+    pub(crate) fn padding_done(&self) -> bool {
         !self.padding
+    }
+
+    pub(crate) fn wants_direct(&self) -> bool {
+        self.direct
     }
 
     /// 伪装帧：空内容 + 长 padding，用来和 VLESS 头拼在同一次写入里遮住头的长度特征。
@@ -169,48 +252,33 @@ impl Padder {
         xtls_padding(&[], CMD_PADDING_CONTINUE, self.uuid.take().as_ref(), true)
     }
 
-    /// 嗅探被代理流量是否是 TLS（xray `XtlsFilterTls` 的客户端所需部分）。
-    fn filter_tls(&mut self, data: &[u8]) {
-        if self.filter_budget == 0 {
-            return;
-        }
-        self.filter_budget -= 1;
-        if data.len() >= 6
-            && data[..2] == TLS_HANDSHAKE_START
-            && data[5] == 0x01 // ClientHello
-        {
-            self.is_tls = true;
-        }
-    }
-
-    /// 给一次写入加帧。返回真正要写进 TLS 流的字节。
-    ///
-    /// `data` 为空表示"只有 VLESS 头"的首次写入 —— xray 对它用长 padding 遮长度特征。
-    pub(crate) fn pad(&mut self, data: &[u8]) -> Vec<u8> {
+    /// 给一次写入加帧，返回真正要写进 TLS 流的字节。对照 xray `VisionWriter.WriteMultiBuffer`。
+    pub(crate) fn pad(&mut self, data: &[u8], ts: &mut TrafficState) -> Vec<u8> {
+        ts.filter(data);
         if !self.padding {
             return data.to_vec();
         }
 
-        self.filter_tls(data);
-
-        // 内层 TLS 已经进入 application_data ⇒ 握手结束 ⇒ 这一帧发 End 并切直通。
-        let handshake_done = self.is_tls
+        let long_padding = ts.is_tls;
+        let (command, long_padding) = if ts.is_tls
             && data.len() >= 6
             && data[..3] == TLS_APPLICATION_DATA_START
-            && is_complete_record(data);
-
-        let (command, long_padding) = if handshake_done {
-            (CMD_PADDING_END, false)
+            && is_complete_record(data)
+        {
+            // 内层握手结束：TLS 1.3 发 Direct（之后上行写裸 socket），否则发 End。
+            self.padding = false;
+            self.direct = ts.enable_xtls;
+            let command = if ts.enable_xtls { CMD_PADDING_DIRECT } else { CMD_PADDING_END };
+            (command, true)
+        } else if !ts.is_tls12_or_above && ts.filter_budget <= 1 {
+            // 不是 TLS 1.2+：嗅探名额快用完就提前结束（xray："finish padding 1 packet early"）。
+            self.padding = false;
+            (CMD_PADDING_END, long_padding)
         } else {
-            (CMD_PADDING_CONTINUE, true)
+            (CMD_PADDING_CONTINUE, long_padding)
         };
 
-        let framed = xtls_padding(data, command, self.uuid.as_ref(), long_padding);
-        self.uuid = None;
-        if handshake_done {
-            self.padding = false;
-        }
-        framed
+        xtls_padding(data, command, self.uuid.take().as_ref(), long_padding)
     }
 }
 
@@ -239,8 +307,11 @@ fn is_complete_record(data: &[u8]) -> bool {
 /// 切到直通后读写都退化成对 `inner` 的直接转发。
 pub struct VisionStream<S> {
     inner: S,
+    traffic: TrafficState,
     padder: Padder,
     unpadder: Unpadder,
+    /// 上行已越过外层 TLS 改写裸 socket（Direct 帧已完整刷出 TLS 之后才置）。
+    uplink_raw: bool,
     /// 已成帧但还没写完的字节。
     write_pending: BytesMut,
     /// 从 inner 读到、还不够一整帧的字节。
@@ -255,8 +326,10 @@ impl<S> VisionStream<S> {
     pub fn new(inner: S, uuid: [u8; 16]) -> Self {
         Self {
             inner,
+            traffic: TrafficState::new(),
             padder: Padder::new(uuid),
             unpadder: Unpadder::new(),
+            uplink_raw: false,
             write_pending: BytesMut::new(),
             read_raw: BytesMut::with_capacity(16 * 1024),
             read_out: BytesMut::new(),
@@ -274,7 +347,7 @@ impl<S> VisionStream<S> {
     }
 }
 
-impl<S: tokio::io::AsyncWrite + Unpin> VisionStream<S> {
+impl<S: tokio::io::AsyncWrite + Unpin + super::record_gate::DirectSwitch> VisionStream<S> {
     /// 首次写入：VLESS 头（裸，不进 Vision 帧）‖ 第一个 Vision 帧，**一次写出**，
     /// 二者落在同一条 TLS 记录里，头的长度特征被 padding 遮住。
     /// 有首包就让它走正常的 padding（也参与 TLS 嗅探）；没有就发伪装帧。
@@ -285,7 +358,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> VisionStream<S> {
         let frame = if payload.is_empty() {
             self.padder.camouflage()
         } else {
-            self.padder.pad(payload)
+            self.padder.pad(payload, &mut self.traffic)
         };
         let mut first = Vec::with_capacity(header.len() + frame.len());
         first.extend_from_slice(header);
@@ -318,9 +391,26 @@ impl<S: tokio::io::AsyncWrite + Unpin> VisionStream<S> {
         }
         Poll::Ready(Ok(()))
     }
+
+    /// 排空已成的帧；若刚发出 Direct 帧，再把外层 TLS 完整刷出，然后才切裸写。
+    /// 顺序不能反：TLS 记录还没出 socket 就开始裸写，两者会交错（xray #5737）。
+    fn poll_settle(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::ready!(self.poll_drain(cx))?;
+        if self.padder.wants_direct() && !self.uplink_raw {
+            std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_flush(cx))?;
+            self.uplink_raw = true;
+            tracing::debug!("vision uplink switched to direct");
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for VisionStream<S> {
+impl<S: tokio::io::AsyncWrite + Unpin + super::record_gate::DirectSwitch> tokio::io::AsyncWrite
+    for VisionStream<S>
+{
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -330,17 +420,22 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for VisionStream<S>
 
         let me = self.get_mut();
 
-        // 上一次成的帧还没写完：先排空，避免无限缓冲。
-        std::task::ready!(me.poll_drain(cx))?;
+        // 上一次成的帧还没写完：先排空（必要时完成裸写切换），避免无限缓冲。
+        std::task::ready!(me.poll_settle(cx))?;
 
-        // 直通阶段没有帧，直接写，省一次拷贝。
-        if me.padder.is_direct() {
-            return std::pin::Pin::new(&mut me.inner).poll_write(cx, buf);
+        // padding 结束后没有帧：Direct 之后写裸 socket，End 之后仍写外层 TLS。
+        if me.padder.padding_done() {
+            me.traffic.filter(buf);
+            return if me.uplink_raw {
+                std::pin::Pin::new(&mut me.inner).poll_write_direct(cx, buf)
+            } else {
+                std::pin::Pin::new(&mut me.inner).poll_write(cx, buf)
+            };
         }
 
-        me.write_pending.extend_from_slice(&me.padder.pad(buf));
-        // 帧已接管全部输入，故对上层报告写入完成；余下由 poll_drain / poll_flush 负责送出。
-        match me.poll_drain(cx) {
+        me.write_pending.extend_from_slice(&me.padder.pad(buf, &mut me.traffic));
+        // 帧已接管全部输入，故对上层报告写入完成；余下由 poll_settle / poll_flush 负责送出。
+        match me.poll_settle(cx) {
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             _ => Poll::Ready(Ok(buf.len())),
         }
@@ -351,8 +446,12 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for VisionStream<S>
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let me = self.get_mut();
-        std::task::ready!(me.poll_drain(cx))?;
-        std::pin::Pin::new(&mut me.inner).poll_flush(cx)
+        std::task::ready!(me.poll_settle(cx))?;
+        if me.uplink_raw {
+            std::pin::Pin::new(&mut me.inner).poll_flush_direct(cx)
+        } else {
+            std::pin::Pin::new(&mut me.inner).poll_flush(cx)
+        }
     }
 
     fn poll_shutdown(
@@ -360,8 +459,14 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for VisionStream<S>
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let me = self.get_mut();
-        std::task::ready!(me.poll_drain(cx))?;
-        std::pin::Pin::new(&mut me.inner).poll_shutdown(cx)
+        std::task::ready!(me.poll_settle(cx))?;
+        // 上行已是裸流：只关套接字写端。经 TLS 关会发 close_notify，对端在裸流里
+        // 读到一条 TLS alert（xray `SuppressOuterCloseNotify`）。
+        if me.uplink_raw {
+            std::pin::Pin::new(&mut me.inner).poll_shutdown_direct(cx)
+        } else {
+            std::pin::Pin::new(&mut me.inner).poll_shutdown(cx)
+        }
     }
 }
 
@@ -419,6 +524,10 @@ impl<S: tokio::io::AsyncRead + Unpin + super::record_gate::DirectSwitch> tokio::
             me.unpadder
                 .unpad(&mut me.read_raw, &mut out)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            if !out.is_empty() {
+                // 下行嗅探内层 ServerHello：决定上行结束 padding 时发 Direct 还是 End。
+                me.traffic.filter(&out);
+            }
             me.read_out.extend_from_slice(&out);
 
             // 刚刚切到直通：把 TLS 层下面已缓冲、尚未解析的裸字节接上，
@@ -461,9 +570,9 @@ mod tests {
     /// 只有第一帧带 UUID，后续帧不带。
     #[test]
     fn only_first_frame_carries_uuid() {
-        let mut p = Padder::new(UUID);
-        let first = p.pad(b"aaa");
-        let second = p.pad(b"bbb");
+        let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+        let first = p.pad(b"aaa", &mut ts);
+        let second = p.pad(b"bbb", &mut ts);
         assert_eq!(&first[..16], &UUID);
         assert_ne!(&second[..16], &UUID);
 
@@ -515,53 +624,141 @@ mod tests {
         assert!(u.unpad(&mut buf, &mut out).is_err());
     }
 
-    /// 非 TLS 流量不会误切直通：一直加 padding。
+    /// 内层 ClientHello（0x16 0x03 0x01 ... 0x01）。
+    fn client_hello() -> Vec<u8> {
+        let mut ch = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01];
+        ch.extend_from_slice(&[0u8; 4]);
+        ch
+    }
+
+    /// 完整的内层 application_data 记录。
+    fn app_data() -> Vec<u8> {
+        let mut ad = vec![0x17, 0x03, 0x03, 0x00, 0x08];
+        ad.extend_from_slice(&[0x42u8; 8]);
+        ad
+    }
+
+    /// 内层 ServerHello 记录。`tls13` 决定是否带 supported_versions(0x0304) 扩展。
+    fn server_hello(cipher: u16, tls13: bool) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x5A; 32]); // random
+        body.push(32);
+        body.extend_from_slice(&[0x33; 32]); // legacy_session_id_echo
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.push(0); // compression
+        let mut exts = vec![0x00, 0x33, 0x00, 0x02, 0x00, 0x1d]; // 随便一个扩展垫位置
+        if tls13 {
+            exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        }
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = vec![0x02, 0x00];
+        hs.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x03];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
     #[test]
-    fn plain_traffic_keeps_padding() {
-        let mut p = Padder::new(UUID);
-        for _ in 0..4 {
-            p.pad(b"plain http payload");
-            assert!(!p.is_direct());
+    fn sniffs_tls13_server_hello_enables_xtls() {
+        let mut ts = TrafficState::new();
+        ts.filter(&server_hello(0x1301, true));
+        assert!(ts.is_tls && ts.is_tls12_or_above && ts.enable_xtls);
+        assert_eq!(ts.filter_budget, 0, "判定出结果后停止嗅探");
+    }
+
+    /// TLS_AES_128_CCM_8_SHA256 不开 XTLS（xray `XtlsFilterTls`）。
+    #[test]
+    fn sniffs_tls13_ccm8_without_xtls() {
+        let mut ts = TrafficState::new();
+        ts.filter(&server_hello(0x1305, true));
+        assert!(ts.is_tls12_or_above && !ts.enable_xtls);
+    }
+
+    #[test]
+    fn sniffs_tls12_server_hello() {
+        let mut ts = TrafficState::new();
+        ts.filter(&server_hello(0xc02f, false));
+        assert!(ts.is_tls && ts.is_tls12_or_above && !ts.enable_xtls);
+        assert_eq!(ts.filter_budget, 0);
+    }
+
+    #[test]
+    fn sniffs_client_hello_and_counts_packets() {
+        let mut ts = TrafficState::new();
+        ts.filter(&client_hello());
+        assert!(ts.is_tls && !ts.is_tls12_or_above);
+        assert_eq!(ts.filter_budget, 7);
+    }
+
+    /// 非 TLS 流量：嗅探名额快用完时提前发 End 结束 padding（xray："finish padding
+    /// 1 packet early"）。名额两个方向共用，第 7 个包之后只剩 1 个。
+    #[test]
+    fn plain_traffic_ends_padding_when_filter_runs_out() {
+        let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+        let first = p.pad(b"plain http payload", &mut ts);
+        assert_eq!(first[UUID_LEN], CMD_PADDING_CONTINUE);
+        for _ in 0..5 {
+            assert_eq!(p.pad(b"more", &mut ts)[0], CMD_PADDING_CONTINUE);
+        }
+        assert!(!p.padding_done());
+
+        assert_eq!(p.pad(b"seventh", &mut ts)[0], CMD_PADDING_END);
+        assert!(p.padding_done() && !p.wants_direct());
+        assert_eq!(p.pad(b"after", &mut ts), b"after");
+    }
+
+    /// 非 TLS 流量用短 padding（xray：`longPadding := IsTLS`）。
+    #[test]
+    fn plain_traffic_uses_short_padding() {
+        for _ in 0..20 {
+            let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+            let framed = p.pad(b"x", &mut ts);
+            let pad_len = u16::from_be_bytes([framed[UUID_LEN + 3], framed[UUID_LEN + 4]]);
+            assert!((pad_len as u32) < SEED_SHORT_RANGE);
         }
     }
 
-    /// 内层 TLS：握手记录继续 padding，出现完整 application_data 才发 End 切直通。
+    /// 内层 TLS 1.3：完整 application_data 记录这一帧发 Direct，并要求切裸写。
     #[test]
-    fn switches_to_direct_on_inner_application_data() {
-        let mut p = Padder::new(UUID);
+    fn tls13_application_data_sends_direct() {
+        let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+        assert_eq!(p.pad(&client_hello(), &mut ts)[UUID_LEN], CMD_PADDING_CONTINUE);
+        ts.filter(&server_hello(0x1301, true)); // 下行读路径嗅探到的
+        assert!(!p.padding_done());
 
-        // 内层 ClientHello（0x16 0x03 0x01 ... 0x01）
-        let mut client_hello = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01];
-        client_hello.extend_from_slice(&[0u8; 4]);
-        let framed = p.pad(&client_hello);
-        assert_eq!(framed[16], CMD_PADDING_CONTINUE); // 跳过 UUID 前缀
-        assert!(!p.is_direct());
-
-        // 内层 application_data：0x17 0x03 0x03 + 长度 + 载荷
-        let mut app_data = vec![0x17, 0x03, 0x03, 0x00, 0x08];
-        app_data.extend_from_slice(&[0x42u8; 8]);
-        let framed = p.pad(&app_data);
-        assert_eq!(framed[0], CMD_PADDING_END);
-        assert!(p.is_direct());
-
-        // 切直通后原样透传
-        assert_eq!(p.pad(b"raw"), b"raw");
+        assert_eq!(p.pad(&app_data(), &mut ts)[0], CMD_PADDING_DIRECT);
+        assert!(p.padding_done() && p.wants_direct());
+        assert_eq!(p.pad(b"raw", &mut ts), b"raw");
     }
 
-    /// application_data 记录不完整时不能切直通（长度字段说还有更多字节）。
+    /// 内层 TLS 1.2（或没见到 ServerHello）：同一位置发 End，仍走外层 TLS。
+    #[test]
+    fn tls12_application_data_sends_end() {
+        let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+        p.pad(&client_hello(), &mut ts);
+        ts.filter(&server_hello(0xc02f, false));
+
+        assert_eq!(p.pad(&app_data(), &mut ts)[0], CMD_PADDING_END);
+        assert!(p.padding_done() && !p.wants_direct());
+    }
+
+    /// application_data 记录不完整时不能结束 padding（长度字段说还有更多字节）。
     #[test]
     fn incomplete_record_does_not_switch() {
-        let mut p = Padder::new(UUID);
-        let mut ch = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01];
-        ch.extend_from_slice(&[0u8; 4]);
-        p.pad(&ch);
+        let (mut p, mut ts) = (Padder::new(UUID), TrafficState::new());
+        p.pad(&client_hello(), &mut ts);
+        ts.filter(&server_hello(0x1301, true));
 
         // 声称载荷 8 字节，实际只给 3
         let mut partial = vec![0x17, 0x03, 0x03, 0x00, 0x08];
         partial.extend_from_slice(&[0x42u8; 3]);
-        let framed = p.pad(&partial);
+        let framed = p.pad(&partial, &mut ts);
         assert_eq!(framed[0], CMD_PADDING_CONTINUE);
-        assert!(!p.is_direct());
+        assert!(!p.padding_done());
     }
 
     /// VisionStream 写出去的字节，必须能被独立的解帧状态机还原成原始数据。
@@ -708,14 +905,11 @@ mod tests {
     async fn first_payload_feeds_tls_sniffing() {
         let (_peer, sock) = tokio::io::duplex(64 * 1024);
         let mut vs = VisionStream::client(sock, UUID);
-        let mut client_hello = vec![0x16, 0x03, 0x01, 0x00, 0x05, 0x01];
-        client_hello.extend_from_slice(&[0u8; 4]);
-        vs.write_first(b"HDR", &client_hello).await.unwrap();
+        vs.write_first(b"HDR", &client_hello()).await.unwrap();
+        assert!(vs.traffic.is_tls);
 
-        let mut app_data = vec![0x17, 0x03, 0x03, 0x00, 0x08];
-        app_data.extend_from_slice(&[0x42u8; 8]);
-        vs.write_all(&app_data).await.unwrap();
-        assert!(vs.padder.is_direct());
+        vs.write_all(&app_data()).await.unwrap();
+        assert!(vs.padder.padding_done());
     }
 
     /// 测试替身：区分"经 TLS 读"（`tls`）与"越过 TLS 读裸 socket"（`raw`）。
@@ -766,6 +960,28 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.raw), cx, buf)
         }
+
+        fn poll_write_direct(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.raw), cx, buf)
+        }
+
+        fn poll_flush_direct(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.raw), cx)
+        }
+
+        fn poll_shutdown_direct(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.raw), cx)
+        }
     }
 
     /// 读满 `want` 字节；超时说明读错了来源。
@@ -808,6 +1024,78 @@ mod tests {
 
         assert_eq!(read_n(&mut vs, 14).await, b"hello raw tail");
         assert!(vs.unpadder.is_direct());
+    }
+
+    /// 上行 Direct：下行嗅探到内层 TLS 1.3 ServerHello 后，第一个完整 application_data
+    /// 记录发 Direct 帧（仍经 TLS），**此后**的上行写裸 socket。Direct 帧必须先完整
+    /// 刷出 TLS，裸写才开始（xray #5737 修的就是这里的竞态）。
+    #[tokio::test]
+    async fn uplink_direct_switches_writes_to_raw_socket() {
+        let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
+        let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+
+        vs.write_all(&client_hello()).await.unwrap();
+        let sh = server_hello(0x1301, true);
+        tls_peer.write_all(&xtls_padding(&sh, CMD_PADDING_CONTINUE, Some(&UUID), true)).await.unwrap();
+        assert_eq!(read_n(&mut vs, sh.len()).await, sh);
+        assert!(vs.traffic.enable_xtls, "读路径要嗅探内层 ServerHello");
+
+        vs.write_all(&app_data()).await.unwrap();
+        vs.write_all(b"raw uplink").await.unwrap();
+        vs.flush().await.unwrap();
+
+        // TLS 侧：ClientHello 帧 + Direct 帧（携带 app_data），之后没有别的。
+        let mut wire = vec![0u8; 8192];
+        let n = tls_peer.read(&mut wire).await.unwrap();
+        let (u, out) = unpad_all(&wire[..n]);
+        assert!(u.is_direct());
+        let mut want = client_hello();
+        want.extend_from_slice(&app_data());
+        assert_eq!(out, want);
+
+        // 裸 socket 侧：Direct 之后的上行数据。
+        assert_eq!(read_n(&mut raw_peer, 10).await, b"raw uplink");
+    }
+
+    /// 上行已切裸 socket 后关闭：只关裸 socket 的写端，不能经 TLS 发 close_notify
+    /// （xray `SuppressOuterCloseNotify`），否则对端在裸流里读到一条 TLS alert。
+    #[tokio::test]
+    async fn shutdown_after_uplink_direct_skips_tls() {
+        let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
+        let (mut raw_peer, raw) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+
+        vs.write_all(&client_hello()).await.unwrap();
+        vs.traffic.filter(&server_hello(0x1301, true));
+        vs.write_all(&app_data()).await.unwrap();
+        vs.write_all(b"bye").await.unwrap();
+        vs.shutdown().await.unwrap();
+
+        assert_eq!(read_n(&mut raw_peer, 3).await, b"bye");
+        let mut rest = Vec::new();
+        raw_peer.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "裸 socket 写端应已关闭");
+
+        let mut wire = vec![0u8; 8192];
+        let _ = tls_peer.read(&mut wire).await.unwrap(); // 两个帧
+        let closed = tokio::time::timeout(std::time::Duration::from_millis(100), tls_peer.read(&mut wire)).await;
+        assert!(closed.is_err(), "TLS 侧不该被关闭（不该有 close_notify / shutdown）");
+    }
+
+    /// 没切裸写（End 路径）时关闭照常走 TLS。
+    #[tokio::test]
+    async fn shutdown_without_uplink_direct_uses_tls() {
+        let (mut tls_peer, tls) = tokio::io::duplex(64 * 1024);
+        let (_raw_peer, raw) = tokio::io::duplex(64 * 1024);
+        let mut vs = VisionStream::new(SplitInner { tls, raw }, UUID);
+
+        vs.write_all(b"plain").await.unwrap();
+        vs.shutdown().await.unwrap();
+        let mut all = Vec::new();
+        tls_peer.read_to_end(&mut all).await.unwrap();
+        let (_, out) = unpad_all(&all);
+        assert_eq!(out, b"plain");
     }
 
     /// padding 长度必须落在 xray 的公式范围内，且不越 buf.Size 上限。

@@ -166,7 +166,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RecordGate<S> {
 
 // ---------------------------------------------------------------------------
 
-/// Vision 切直通时需要的两件事：把闸门开着，以及在切换后越过 TLS 直接读套接字。
+/// Vision 切直通时需要的几件事：把闸门开着，以及在切换后越过 TLS 直接读写套接字。
 ///
 /// 为普通流提供退化实现（没有 TLS 层，也就没有裸字节残留），供测试使用。
 pub trait DirectSwitch {
@@ -184,6 +184,18 @@ pub trait DirectSwitch {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>>;
+
+    /// 上行切直通后：越过 TLS 直接写套接字。调用方须保证 TLS 层已刷空。
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>>;
+
+    fn poll_flush_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+
+    /// 上行切直通后关闭：只关套接字写端，不经 TLS 发 close_notify。
+    fn poll_shutdown_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> DirectSwitch
@@ -205,6 +217,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DirectSwitch
         let gate = &mut self.get_mut().get_mut().0;
         Pin::new(gate.get_mut()).poll_read(cx, buf)
     }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let gate = &mut self.get_mut().get_mut().0;
+        Pin::new(gate.get_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_flush_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let gate = &mut self.get_mut().get_mut().0;
+        Pin::new(gate.get_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let gate = &mut self.get_mut().get_mut().0;
+        Pin::new(gate.get_mut()).poll_shutdown(cx)
+    }
 }
 
 impl DirectSwitch for tokio::io::DuplexStream {
@@ -214,6 +245,22 @@ impl DirectSwitch for tokio::io::DuplexStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.poll_read(cx, buf)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write(cx, buf)
+    }
+
+    fn poll_flush_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+
+    fn poll_shutdown_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_shutdown(cx)
     }
 }
 
